@@ -19,5 +19,8 @@ def install_tracer_provider() -> TracerProvider:
 
 
 def instrument(app: FastAPI, upstream_client: httpx.AsyncClient) -> None:
-    FastAPIInstrumentor.instrument_app(app, excluded_urls="healthz")
+    # Without exclude_spans, ASGI emits one "http send" span per streamed chunk.
+    FastAPIInstrumentor.instrument_app(
+        app, excluded_urls="healthz", exclude_spans=["receive", "send"]
+    )
     HTTPXClientInstrumentor.instrument_client(upstream_client)
