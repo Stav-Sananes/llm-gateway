@@ -1,19 +1,19 @@
-
 import hashlib
 import secrets
 from dataclasses import dataclass
-from llm_gateway.chat.model import Usage
 
 
 @dataclass(frozen=True)
 class IssuedKey:
     plaintext: str
     prefix: str
-    key_hash: Usage | None = None
- 
-def hash_key(plaintext:str) -> str:
+    key_hash: str
+
+
+def hash_key(plaintext: str) -> str:
     """Stored instead of the key, so a DB leak exposes no usable keys."""
     return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+
 
 def issue_key() -> IssuedKey:
     """Mint a new key: gw_<prefix>_<secret>, plus its hash for storage."""
