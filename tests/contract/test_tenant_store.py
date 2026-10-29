@@ -13,11 +13,6 @@ pytestmark = pytest.mark.anyio
 
 
 @pytest.fixture
-def anyio_backend() -> str:
-    return "asyncio"
-
-
-@pytest.fixture
 def store() -> TenantStore:
     return InMemoryTenantStore()
 

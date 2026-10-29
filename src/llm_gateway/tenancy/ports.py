@@ -13,6 +13,10 @@ class KeyNotFoundError(Exception):
     """No key has this prefix."""
 
 
+class TenantNotFoundError(Exception):
+    """Tenant not found."""
+
+
 class TenantStore(Protocol):
     async def add_tenant(self, tenant: Tenant) -> None:
         """Add a new tenant. Raises DuplicateTenantError if the name is taken."""
