@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from llm_gateway import telemetry
 from llm_gateway.chat.use_case import ChatCompletions
@@ -27,6 +28,20 @@ def build_upstream_client(settings: Settings) -> httpx.AsyncClient:
     )
 
 
+def build_engine(settings: Settings) -> AsyncEngine:
+    return create_async_engine(
+        settings.database_url,
+        pool_size=settings.database_pool_size,
+        # Bounded waits everywhere: pool checkout, connecting, and each statement.
+        pool_timeout=settings.database_connect_timeout_s,
+        pool_pre_ping=True,
+        connect_args={
+            "timeout": settings.database_connect_timeout_s,
+            "command_timeout": settings.database_statement_timeout_s,
+        },
+    )
+
+
 def build_app(settings: Settings) -> FastAPI:
     tracer_provider = telemetry.install_tracer_provider() if settings.tracing_enabled else None
     upstream_client = build_upstream_client(settings)
@@ -45,6 +60,5 @@ def build_app(settings: Settings) -> FastAPI:
     return app
 
 
-def run() -> None:
-    settings = Settings()
+def run(settings: Settings) -> None:
     uvicorn.run(build_app(settings), host=settings.host, port=settings.port)

@@ -7,6 +7,8 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.20.1",
+    "asyncpg>=0.32.0",
     "fastapi>=0.162.0",
     "httpx>=0.28.1",
     "opentelemetry-api>=1.45.1",
@@ -15,11 +17,12 @@ dependencies = [
     "opentelemetry-instrumentation-httpx>=0.66b1",
     "opentelemetry-sdk>=1.45.1",
     "pydantic-settings>=2.16.1",
+    "sqlalchemy[asyncio]>=2.1.6",
     "uvicorn[standard]>=0.54.0",
 ]
 
 [project.scripts]
-llm-gateway = "llm_gateway.main:run"
+llm-gateway = "llm_gateway.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12.0"]
@@ -30,6 +33,7 @@ dev = [
     "mypy>=2.4.0",
     "pytest>=9.1.1",
     "ruff>=0.17.3",
+    "testcontainers[postgres]>=4.15.0",
 ]
 
 [tool.ruff]
