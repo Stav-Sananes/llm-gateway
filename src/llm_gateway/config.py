@@ -17,4 +17,9 @@ class Settings(BaseSettings):
     upstream_read_timeout_s: float = 60.0
     upstream_max_connections: int = 100
 
+    database_url: str = "postgresql+asyncpg://gateway:gateway@localhost:5433/gateway"
+    database_connect_timeout_s: float = 2.0
+    database_statement_timeout_s: float = 5.0
+    database_pool_size: int = 10
+
     tracing_enabled: bool = False

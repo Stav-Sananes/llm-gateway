@@ -1,20 +1,33 @@
-"""Behaviour every TenantStore must have. Task 5 runs these against Postgres too."""
+"""Behaviour every TenantStore must have: each test runs against the fake and real Postgres."""
 
+from collections.abc import AsyncIterator
 from uuid import uuid4
 
 import pytest
 
+from llm_gateway.config import Settings
+from llm_gateway.main import build_engine
+from llm_gateway.storage.tenant_store import PostgresTenantStore
 from llm_gateway.tenancy.keys import issue_key
 from llm_gateway.tenancy.model import StoredKey, Tenant
 from llm_gateway.tenancy.ports import DuplicateTenantError, KeyNotFoundError, TenantStore
 from tests.support.in_memory_tenant_store import InMemoryTenantStore
+from tests.support.postgres import empty_tables
 
 pytestmark = pytest.mark.anyio
 
 
-@pytest.fixture
-def store() -> TenantStore:
-    return InMemoryTenantStore()
+@pytest.fixture(params=["memory", "postgres"])
+async def store(request: pytest.FixtureRequest) -> AsyncIterator[TenantStore]:
+    if request.param == "memory":
+        yield InMemoryTenantStore()
+        return
+    engine = build_engine(Settings(database_url=request.getfixturevalue("postgres_url")))
+    try:
+        await empty_tables(engine)
+        yield PostgresTenantStore(engine)
+    finally:
+        await engine.dispose()
 
 
 def a_tenant(name: str = "acme") -> Tenant:

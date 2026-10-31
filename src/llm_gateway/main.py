@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from llm_gateway import telemetry
 from llm_gateway.chat.use_case import ChatCompletions
@@ -24,6 +25,20 @@ def build_upstream_client(settings: Settings) -> httpx.AsyncClient:
             pool=settings.upstream_connect_timeout_s,
         ),
         limits=httpx.Limits(max_connections=settings.upstream_max_connections),
+    )
+
+
+def build_engine(settings: Settings) -> AsyncEngine:
+    return create_async_engine(
+        settings.database_url,
+        pool_size=settings.database_pool_size,
+        # Bounded waits everywhere: pool checkout, connecting, and each statement.
+        pool_timeout=settings.database_connect_timeout_s,
+        pool_pre_ping=True,
+        connect_args={
+            "timeout": settings.database_connect_timeout_s,
+            "command_timeout": settings.database_statement_timeout_s,
+        },
     )
 
 
