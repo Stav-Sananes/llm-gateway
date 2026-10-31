@@ -88,8 +88,8 @@ def completion_payload(identity: ResponseIdentity, completion: Completion) -> di
     return payload
 
 
-def error_payload(message: str, error_type: str) -> dict[str, Any]:
-    return {"error": {"message": message, "type": error_type, "code": None}}
+def error_payload(message: str, error_type: str, code: str | None = None) -> dict[str, Any]:
+    return {"error": {"message": message, "type": error_type, "code": code}}
 
 
 def _usage_fields(usage: Usage) -> dict[str, int]:

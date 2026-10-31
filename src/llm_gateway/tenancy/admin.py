@@ -2,12 +2,23 @@ import uuid
 
 from llm_gateway.tenancy.keys import IssuedKey, issue_key
 from llm_gateway.tenancy.model import StoredKey, Tenant
-from llm_gateway.tenancy.ports import TenantNotFoundError, TenantStore
+from llm_gateway.tenancy.ports import (
+    KeyCache,
+    KeyCacheUnavailableError,
+    KeyNotFoundError,
+    TenantNotFoundError,
+    TenantStore,
+)
+
+
+class KeyCacheNotClearedError(Exception):
+    """The key was revoked, but its cache entry could not be removed."""
 
 
 class TenantAdmin:
-    def __init__(self, store: TenantStore) -> None:
+    def __init__(self, store: TenantStore, cache: KeyCache) -> None:
         self._store = store
+        self._cache = cache
 
     async def create_tenant(self, name: str) -> Tenant:
         """
@@ -37,6 +48,17 @@ class TenantAdmin:
 
     async def revoke_key(self, prefix: str) -> None:
         """
-        Revoke a key. Raises KeyNotFoundError if no key has this prefix.
+        Revoke a key and mark it revoked in the cache. Raises KeyNotFoundError if no key has this
+        prefix, and KeyCacheNotClearedError if the cache can't be reached.
         """
+        key = await self._store.key_with_prefix(prefix)
+        if key is None:
+            raise KeyNotFoundError(f"no key with prefix {prefix!r}")
         await self._store.revoke_key(prefix=prefix)
+        try:
+            await self._cache.mark_revoked(key.key_hash)
+        except KeyCacheUnavailableError as error:
+            raise KeyCacheNotClearedError(
+                f"key {prefix} is revoked, but the key cache could not be cleared; "
+                "it keeps working until its cache entry expires"
+            ) from error

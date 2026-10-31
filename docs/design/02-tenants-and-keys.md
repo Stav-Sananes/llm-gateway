@@ -38,7 +38,7 @@ docker compose run --rm --no-deps gateway llm-gateway admin revoke-key <prefix>
 
 ## Known gaps (on purpose)
 
-- Nothing checks keys on requests yet. Bearer auth and the Redis key cache come in the next PR.
+- Nothing checks keys on requests yet. Bearer auth and the Redis key cache come in the next PR ([03](03-bearer-auth.md)).
 - Prefix collisions: 8 hex chars give about 4 billion prefixes, so a collision becomes likely only after tens of thousands of keys. When one happens, `create-key` fails on the primary key and the operator retries. A retry loop can come later.
 - There's no `list-keys` or `delete-tenant` command.
 

@@ -1,6 +1,6 @@
 import re
 
-from llm_gateway.tenancy.keys import hash_key, issue_key
+from llm_gateway.tenancy.keys import hash_key, issue_key, looks_like_key
 
 HEX_64 = re.compile(r"[0-9a-f]{64}")
 
@@ -42,3 +42,16 @@ def test_hash_does_not_reveal_the_secret() -> None:
     secret = issued.plaintext.split("_", 2)[2]
 
     assert secret not in issued.key_hash
+
+
+def test_issued_keys_have_the_key_shape() -> None:
+    assert all(looks_like_key(issue_key().plaintext) for _ in range(100))
+
+
+def test_other_strings_do_not_have_the_key_shape() -> None:
+    key = issue_key().plaintext
+
+    assert not looks_like_key("")
+    assert not looks_like_key("sk-" + key[3:])
+    assert not looks_like_key(key[:-1])
+    assert not looks_like_key(key + "x")

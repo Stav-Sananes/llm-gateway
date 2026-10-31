@@ -23,6 +23,9 @@ class InMemoryTenantStore:
     async def add_key(self, key: StoredKey) -> None:
         self._keys_by_prefix[key.prefix] = key
 
+    async def key_with_prefix(self, prefix: str) -> StoredKey | None:
+        return self._keys_by_prefix.get(prefix)
+
     async def revoke_key(self, prefix: str) -> None:
         if prefix not in self._keys_by_prefix:
             raise KeyNotFoundError(f"no key with prefix {prefix!r}")

@@ -1,4 +1,4 @@
-"""The admin CLI against a real, migrated Postgres: what an operator actually types."""
+"""The admin CLI against real Postgres and Redis: what an operator actually types."""
 
 import asyncio
 
@@ -6,37 +6,23 @@ import pytest
 
 from llm_gateway.cli import main
 from llm_gateway.config import Settings
-from llm_gateway.main import build_engine
-from llm_gateway.storage.tenant_store import PostgresTenantStore
-from llm_gateway.tenancy.keys import hash_key
+from llm_gateway.tenancy.auth import Authenticator, InvalidApiKeyError
 from llm_gateway.tenancy.model import Tenant
-from tests.support.postgres import empty_tables
+from tests.support.backing_services import real_store_and_cache
+from tests.support.servers import unused_local_url
 
 
-@pytest.fixture(autouse=True)
-def empty_database(postgres_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GATEWAY_DATABASE_URL", postgres_url)
-    asyncio.run(_empty(postgres_url))
+def tenant_for(settings: Settings, plaintext_key: str) -> Tenant | None:
+    """Authenticate the way the gateway does: Redis first, then Postgres."""
+    return asyncio.run(_authenticate(settings, plaintext_key))
 
 
-def tenant_for(postgres_url: str, plaintext_key: str) -> Tenant | None:
-    return asyncio.run(_tenant_for_key(postgres_url, hash_key(plaintext_key)))
-
-
-async def _empty(postgres_url: str) -> None:
-    engine = build_engine(Settings(database_url=postgres_url))
-    try:
-        await empty_tables(engine)
-    finally:
-        await engine.dispose()
-
-
-async def _tenant_for_key(postgres_url: str, key_hash: str) -> Tenant | None:
-    engine = build_engine(Settings(database_url=postgres_url))
-    try:
-        return await PostgresTenantStore(engine).tenant_for_key(key_hash)
-    finally:
-        await engine.dispose()
+async def _authenticate(settings: Settings, plaintext_key: str) -> Tenant | None:
+    async with real_store_and_cache(settings) as (store, cache):
+        try:
+            return await Authenticator(store, cache).authenticate(plaintext_key)
+        except InvalidApiKeyError:
+            return None
 
 
 def admin(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, str, str]:
@@ -46,7 +32,7 @@ def admin(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, str, str
 
 
 def test_issued_key_authenticates_as_its_tenant(
-    postgres_url: str, capsys: pytest.CaptureFixture[str]
+    services: Settings, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert admin(capsys, "create-tenant", "acme")[0] == 0
 
@@ -55,23 +41,51 @@ def test_issued_key_authenticates_as_its_tenant(
     assert exit_code == 0
     assert key.startswith("gw_")
     assert "not be shown again" in warning
-    tenant = tenant_for(postgres_url, key)
+    tenant = tenant_for(services, key)
     assert tenant is not None
     assert tenant.name == "acme"
 
 
-def test_revoked_key_no_longer_authenticates(
-    postgres_url: str, capsys: pytest.CaptureFixture[str]
+def test_revoked_key_no_longer_authenticates_even_when_cached(
+    services: Settings, capsys: pytest.CaptureFixture[str]
 ) -> None:
     admin(capsys, "create-tenant", "acme")
     key = admin(capsys, "create-key", "acme")[1]
     prefix = key.split("_", 2)[1]
+    assert tenant_for(services, key) is not None  # now cached in Redis
 
     exit_code, out, _ = admin(capsys, "revoke-key", prefix)
 
     assert exit_code == 0
     assert out == f"revoked key {prefix}"
-    assert tenant_for(postgres_url, key) is None
+    assert tenant_for(services, key) is None
+
+
+def test_revoke_with_redis_down_still_revokes_and_exits_1(
+    services: Settings, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admin(capsys, "create-tenant", "acme")
+    key = admin(capsys, "create-key", "acme")[1]
+    prefix = key.split("_", 2)[1]
+    monkeypatch.setenv("GATEWAY_REDIS_URL", unused_local_url().replace("http://", "redis://"))
+
+    exit_code, _, err = admin(capsys, "revoke-key", prefix)
+
+    assert exit_code == 1
+    assert "could not be cleared" in err
+    assert tenant_for(services, key) is None  # Postgres has the revocation
+
+
+def test_database_down_is_a_message_not_a_traceback(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port = unused_local_url().rsplit(":", 1)[1]
+    monkeypatch.setenv("GATEWAY_DATABASE_URL", f"postgresql+asyncpg://u:p@127.0.0.1:{port}/db")
+
+    exit_code, _, err = admin(capsys, "create-tenant", "acme")
+
+    assert exit_code == 1
+    assert err == "error: database unavailable"
 
 
 @pytest.mark.parametrize(
@@ -81,6 +95,7 @@ def test_revoked_key_no_longer_authenticates(
         (["revoke-key", "deadbeef"], "no key with prefix 'deadbeef'"),
     ],
 )
+@pytest.mark.usefixtures("services")
 def test_unknown_names_fail_with_a_message_and_print_no_key(
     capsys: pytest.CaptureFixture[str], command: list[str], expected_error: str
 ) -> None:
@@ -91,6 +106,7 @@ def test_unknown_names_fail_with_a_message_and_print_no_key(
     assert err == f"error: {expected_error}"
 
 
+@pytest.mark.usefixtures("services")
 def test_duplicate_tenant_fails_with_a_message(capsys: pytest.CaptureFixture[str]) -> None:
     admin(capsys, "create-tenant", "acme")
 
@@ -100,6 +116,7 @@ def test_duplicate_tenant_fails_with_a_message(capsys: pytest.CaptureFixture[str
     assert err == "error: tenant 'acme' already exists"
 
 
+@pytest.mark.usefixtures("services")
 def test_migrate_is_safe_to_run_again(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["migrate"]) == 0
     assert capsys.readouterr().out.strip() == "database is up to date"

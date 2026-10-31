@@ -58,28 +58,27 @@ The domain core (routing, budgets, policy, audit) is written in a ports-and-adap
 ## Quickstart
 
 ```bash
-docker compose up --build        # gateway :8080, Jaeger UI :16686
+docker compose up -d --build     # gateway :8080, Jaeger UI :16686
+
+# Every request needs an API key. The key is printed once; only its hash is stored.
+docker compose run --rm --no-deps gateway llm-gateway admin create-tenant acme
+KEY=$(docker compose run --rm --no-deps gateway llm-gateway admin create-key acme)
 
 curl -N localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen2.5:0.5b","stream":true,"messages":[{"role":"user","content":"Hi"}]}'
+
+docker compose run --rm --no-deps gateway llm-gateway admin revoke-key <prefix>   # stops it at once
 ```
 
-Any OpenAI SDK works too: point `base_url` at `http://localhost:8080/v1`.
-
-Tenants and API keys (the key is printed once; only its hash is stored):
-
-```bash
-docker compose run --rm --no-deps gateway llm-gateway admin create-tenant acme
-docker compose run --rm --no-deps gateway llm-gateway admin create-key acme
-docker compose run --rm --no-deps gateway llm-gateway admin revoke-key <prefix>
-```
+Any OpenAI SDK works too: point `base_url` at `http://localhost:8080/v1` and pass the key as `api_key`.
 
 ## Development
 
 ```bash
 uv sync
-uv run pytest            # unit, contract and end-to-end tests (Postgres tests need Docker)
+uv run pytest            # unit, contract and end-to-end tests (Postgres and Redis tests need Docker)
 uv run ruff check . && uv run mypy
 ```
 

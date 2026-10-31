@@ -30,6 +30,18 @@ def serving(app: FastAPI) -> Iterator[str]:
         sock.close()
 
 
+@contextmanager
+def silent_local_url() -> Iterator[str]:
+    """A URL that accepts TCP connections and never answers: a hung server.
+
+    The kernel completes the handshake from the listen backlog, so nothing needs to accept().
+    """
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+
+
 def unused_local_url() -> str:
     """A URL nothing listens on: the port is bound, read, then released."""
     with socket.socket() as sock:

@@ -2,19 +2,20 @@
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
 from llm_gateway.chat.model import collect
 from llm_gateway.chat.use_case import ChatCompletions
+from llm_gateway.http.auth import TenantDependency
 from llm_gateway.http.presenter import ResponseIdentity, completion_payload, render_sse
 from llm_gateway.http.schemas import ChatCompletionBody
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
-def chat_router(chat: ChatCompletions) -> APIRouter:
-    router = APIRouter()
+def chat_router(chat: ChatCompletions, tenant: TenantDependency) -> APIRouter:
+    router = APIRouter(dependencies=[Depends(tenant)])
 
     @router.post("/v1/chat/completions", response_model=None)
     async def create_chat_completion(
