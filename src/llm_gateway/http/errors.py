@@ -1,5 +1,7 @@
 """Maps domain errors and validation failures to OpenAI-style error responses."""
 
+import logging
+
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -8,6 +10,8 @@ from llm_gateway.chat.ports import ProviderRejectedError, ProviderUnavailableErr
 from llm_gateway.http.presenter import error_payload
 from llm_gateway.tenancy.auth import InvalidApiKeyError
 from llm_gateway.tenancy.ports import TenantStoreUnavailableError
+
+logger = logging.getLogger(__name__)
 
 
 def register_error_handlers(app: FastAPI) -> None:
@@ -28,6 +32,8 @@ async def _invalid_api_key(_: Request, error: Exception) -> JSONResponse:
 
 
 async def _tenant_store_unavailable(_: Request, error: Exception) -> JSONResponse:
+    # Only the cause's type: the message holds the SQL parameters, which include the key hash.
+    logger.error("tenant store unavailable (%s)", type(error.__cause__).__name__)
     return JSONResponse(
         error_payload("Authentication is temporarily unavailable.", "service_unavailable"),
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

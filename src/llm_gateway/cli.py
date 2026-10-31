@@ -5,6 +5,8 @@ import asyncio
 import sys
 from collections.abc import Sequence
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from llm_gateway.config import Settings
 from llm_gateway.main import build_engine, build_redis, run
 from llm_gateway.storage.key_cache import RedisKeyCache
@@ -57,6 +59,9 @@ async def _admin(args: argparse.Namespace, settings: Settings) -> int:
         await _run_admin_action(admin, args)
     except ADMIN_ERRORS as error:
         print(f"error: {error}", file=sys.stderr)
+        return 1
+    except (SQLAlchemyError, OSError, TimeoutError):
+        print("error: database unavailable", file=sys.stderr)
         return 1
     finally:
         await redis.aclose()

@@ -5,9 +5,11 @@ from contextlib import suppress
 
 from llm_gateway.tenancy.keys import hash_key, looks_like_key
 from llm_gateway.tenancy.model import Tenant
-from llm_gateway.tenancy.ports import KeyCache, KeyCacheUnavailableError, TenantStore
+from llm_gateway.tenancy.ports import KeyCache, KeyCacheUnavailableError, Revoked, TenantStore
 
 logger = logging.getLogger(__name__)
+
+_UNKNOWN_OR_REVOKED = "unknown or revoked API key"
 
 
 class InvalidApiKeyError(Exception):
@@ -28,22 +30,23 @@ class Authenticator:
         if not looks_like_key(presented_key):
             raise InvalidApiKeyError("malformed API key")
         key_hash = hash_key(presented_key)
-        tenant = await self._cached_tenant(key_hash)
-        if tenant is not None:
-            return tenant
-        tenant = await self._store.tenant_for_key(key_hash)
-        if tenant is None:
-            raise InvalidApiKeyError("unknown or revoked API key")
-        await self._remember(key_hash, tenant)
-        return tenant
-
-    async def _cached_tenant(self, key_hash: str) -> Tenant | None:
         try:
-            return await self._cache.tenant_for_key(key_hash)
+            cached = await self._cache.tenant_for_key(key_hash)
         except KeyCacheUnavailableError:
             logger.warning("key cache unavailable; authenticating against the store")
-            return None
-
-    async def _remember(self, key_hash: str, tenant: Tenant) -> None:
+            # Don't try to cache the result: it would wait out a second cache timeout.
+            return await self._stored_tenant(key_hash)
+        if isinstance(cached, Revoked):
+            raise InvalidApiKeyError(_UNKNOWN_OR_REVOKED)
+        if cached is not None:
+            return cached
+        tenant = await self._stored_tenant(key_hash)
         with suppress(KeyCacheUnavailableError):
             await self._cache.remember(key_hash, tenant)
+        return tenant
+
+    async def _stored_tenant(self, key_hash: str) -> Tenant:
+        tenant = await self._store.tenant_for_key(key_hash)
+        if tenant is None:
+            raise InvalidApiKeyError(_UNKNOWN_OR_REVOKED)
+        return tenant

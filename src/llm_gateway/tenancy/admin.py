@@ -48,7 +48,7 @@ class TenantAdmin:
 
     async def revoke_key(self, prefix: str) -> None:
         """
-        Revoke a key and drop it from the cache. Raises KeyNotFoundError if no key has this
+        Revoke a key and mark it revoked in the cache. Raises KeyNotFoundError if no key has this
         prefix, and KeyCacheNotClearedError if the cache can't be reached.
         """
         key = await self._store.key_with_prefix(prefix)
@@ -56,7 +56,7 @@ class TenantAdmin:
             raise KeyNotFoundError(f"no key with prefix {prefix!r}")
         await self._store.revoke_key(prefix=prefix)
         try:
-            await self._cache.forget(key.key_hash)
+            await self._cache.mark_revoked(key.key_hash)
         except KeyCacheUnavailableError as error:
             raise KeyCacheNotClearedError(
                 f"key {prefix} is revoked, but the key cache could not be cleared; "

@@ -54,20 +54,30 @@ class TenantStore(Protocol):
         ...
 
 
+class Revoked:
+    """What the cache holds for a revoked key, so a late cache write can't bring it back."""
+
+
+REVOKED = Revoked()
+
+
 class KeyCache(Protocol):
     """A fast copy of key-hash-to-tenant lookups. Postgres stays the source of truth.
 
     Every method raises KeyCacheUnavailableError when the cache can't be reached.
     """
 
-    async def tenant_for_key(self, key_hash: str) -> Tenant | None:
-        """Get the cached tenant for this key hash, or None on a miss."""
+    async def tenant_for_key(self, key_hash: str) -> Tenant | Revoked | None:
+        """Get the cached tenant for this key hash, REVOKED if it is marked revoked, or None."""
         ...
 
     async def remember(self, key_hash: str, tenant: Tenant) -> None:
-        """Cache the tenant for this key hash, for a limited time."""
+        """Cache the tenant for a limited time, unless the key hash already has an entry.
+
+        Never overwriting is what stops a lookup that raced a revoke from re-caching the key.
+        """
         ...
 
-    async def forget(self, key_hash: str) -> None:
-        """Drop the cached entry for this key hash, if there is one."""
+    async def mark_revoked(self, key_hash: str) -> None:
+        """Replace any entry for this key hash with REVOKED, for a limited time."""
         ...

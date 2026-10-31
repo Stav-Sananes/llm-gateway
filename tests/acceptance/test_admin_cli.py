@@ -9,6 +9,7 @@ from llm_gateway.config import Settings
 from llm_gateway.tenancy.auth import Authenticator, InvalidApiKeyError
 from llm_gateway.tenancy.model import Tenant
 from tests.support.backing_services import real_store_and_cache
+from tests.support.servers import unused_local_url
 
 
 def tenant_for(settings: Settings, plaintext_key: str) -> Tenant | None:
@@ -58,6 +59,33 @@ def test_revoked_key_no_longer_authenticates_even_when_cached(
     assert exit_code == 0
     assert out == f"revoked key {prefix}"
     assert tenant_for(services, key) is None
+
+
+def test_revoke_with_redis_down_still_revokes_and_exits_1(
+    services: Settings, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admin(capsys, "create-tenant", "acme")
+    key = admin(capsys, "create-key", "acme")[1]
+    prefix = key.split("_", 2)[1]
+    monkeypatch.setenv("GATEWAY_REDIS_URL", unused_local_url().replace("http://", "redis://"))
+
+    exit_code, _, err = admin(capsys, "revoke-key", prefix)
+
+    assert exit_code == 1
+    assert "could not be cleared" in err
+    assert tenant_for(services, key) is None  # Postgres has the revocation
+
+
+def test_database_down_is_a_message_not_a_traceback(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port = unused_local_url().rsplit(":", 1)[1]
+    monkeypatch.setenv("GATEWAY_DATABASE_URL", f"postgresql+asyncpg://u:p@127.0.0.1:{port}/db")
+
+    exit_code, _, err = admin(capsys, "create-tenant", "acme")
+
+    assert exit_code == 1
+    assert err == "error: database unavailable"
 
 
 @pytest.mark.parametrize(

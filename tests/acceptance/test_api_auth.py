@@ -1,5 +1,6 @@
 """Bearer-key auth on the API, end to end: real gateway, Postgres, Redis and a fake LLM."""
 
+import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -8,7 +9,8 @@ import pytest
 
 from harness.fake_llm import FakeLlmScript, create_fake_llm
 from llm_gateway.config import Settings
-from llm_gateway.main import build_app
+from llm_gateway.main import build_app, build_redis
+from llm_gateway.tenancy.keys import hash_key
 from tests.support.backing_services import new_api_key, revoke
 from tests.support.servers import serving, unused_local_url
 
@@ -38,6 +40,17 @@ def with_unreachable_postgres(settings: Settings) -> Settings:
 def with_unreachable_redis(settings: Settings) -> Settings:
     url = unused_local_url().replace("http://", "redis://")
     return settings.model_copy(update={"redis_url": url})
+
+
+def cache_ttl_s(settings: Settings, api_key: str) -> int:
+    async def ttl() -> int:
+        redis = build_redis(settings)
+        try:
+            return int(await redis.ttl(f"gw:key:{hash_key(api_key)}"))
+        finally:
+            await redis.aclose()
+
+    return asyncio.run(ttl())
 
 
 def assert_invalid_api_key(response: httpx.Response) -> None:
@@ -85,6 +98,14 @@ def test_revoked_key_is_a_401_even_after_it_was_cached(services: Settings) -> No
         revoke(services, api_key)
 
         assert_invalid_api_key(chat(client, api_key))
+
+
+def test_gateway_caches_keys_for_the_configured_ttl(services: Settings) -> None:
+    api_key = new_api_key(services)
+    with gateway(services) as client:
+        chat(client, api_key)
+
+    assert 0 < cache_ttl_s(services, api_key) <= services.key_cache_ttl_s
 
 
 def test_health_check_needs_no_key(services: Settings) -> None:

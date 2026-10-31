@@ -2,7 +2,12 @@ import pytest
 
 from llm_gateway.tenancy.admin import KeyCacheNotClearedError, TenantAdmin
 from llm_gateway.tenancy.keys import hash_key
-from llm_gateway.tenancy.ports import DuplicateTenantError, KeyNotFoundError, TenantNotFoundError
+from llm_gateway.tenancy.ports import (
+    REVOKED,
+    DuplicateTenantError,
+    KeyNotFoundError,
+    TenantNotFoundError,
+)
 from tests.support.in_memory_key_cache import InMemoryKeyCache, UnreachableKeyCache
 from tests.support.in_memory_tenant_store import InMemoryTenantStore
 
@@ -70,7 +75,7 @@ async def test_revoked_key_no_longer_resolves(
     assert await store.tenant_for_key(issued.key_hash) is None
 
 
-async def test_revoking_drops_the_key_from_the_cache(
+async def test_revoking_marks_the_key_revoked_in_the_cache(
     store: InMemoryTenantStore, cache: InMemoryKeyCache, admin: TenantAdmin
 ) -> None:
     tenant = await admin.create_tenant("acme")
@@ -79,7 +84,7 @@ async def test_revoking_drops_the_key_from_the_cache(
 
     await admin.revoke_key(issued.prefix)
 
-    assert await cache.tenant_for_key(issued.key_hash) is None
+    assert await cache.tenant_for_key(issued.key_hash) is REVOKED
 
 
 async def test_revoking_an_unknown_prefix_is_an_error(admin: TenantAdmin) -> None:
