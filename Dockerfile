@@ -16,4 +16,4 @@ COPY --from=build /app/.venv /app/.venv
 ENV PATH=/app/.venv/bin:$PATH
 USER gateway
 EXPOSE 8080
-CMD ["llm-gateway"]
+CMD ["llm-gateway", "serve"]

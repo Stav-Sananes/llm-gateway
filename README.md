@@ -67,11 +67,19 @@ curl -N localhost:8080/v1/chat/completions \
 
 Any OpenAI SDK works too: point `base_url` at `http://localhost:8080/v1`.
 
+Tenants and API keys (the key is printed once; only its hash is stored):
+
+```bash
+docker compose run --rm --no-deps gateway llm-gateway admin create-tenant acme
+docker compose run --rm --no-deps gateway llm-gateway admin create-key acme
+docker compose run --rm --no-deps gateway llm-gateway admin revoke-key <prefix>
+```
+
 ## Development
 
 ```bash
 uv sync
-uv run pytest            # unit + end-to-end tests against a fake LLM
+uv run pytest            # unit, contract and end-to-end tests (Postgres tests need Docker)
 uv run ruff check . && uv run mypy
 ```
 

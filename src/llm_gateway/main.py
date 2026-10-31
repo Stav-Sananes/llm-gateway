@@ -60,6 +60,5 @@ def build_app(settings: Settings) -> FastAPI:
     return app
 
 
-def run() -> None:
-    settings = Settings()
+def run(settings: Settings) -> None:
     uvicorn.run(build_app(settings), host=settings.host, port=settings.port)
