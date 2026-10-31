@@ -4,12 +4,16 @@ from typing import Any
 
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.engine import Row
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from llm_gateway.storage.tables import TENANT_NAME_UNIQUE, api_keys, tenants
 from llm_gateway.tenancy.model import StoredKey, Tenant
-from llm_gateway.tenancy.ports import DuplicateTenantError, KeyNotFoundError
+from llm_gateway.tenancy.ports import (
+    DuplicateTenantError,
+    KeyNotFoundError,
+    TenantStoreUnavailableError,
+)
 
 
 class PostgresTenantStore:
@@ -67,8 +71,12 @@ class PostgresTenantStore:
             .join(api_keys, api_keys.c.tenant_id == tenants.c.id)
             .where(api_keys.c.key_hash == key_hash, api_keys.c.revoked_at.is_(None))
         )
-        async with self._engine.connect() as connection:
-            row = (await connection.execute(query)).one_or_none()
+        try:
+            async with self._engine.connect() as connection:
+                row = (await connection.execute(query)).one_or_none()
+        except (SQLAlchemyError, OSError, TimeoutError) as error:
+            # On the request path an outage must surface as "unavailable", not a crash.
+            raise TenantStoreUnavailableError(str(error)) from error
         return _tenant(row)
 
 

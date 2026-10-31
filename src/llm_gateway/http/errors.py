@@ -6,12 +6,32 @@ from fastapi.responses import JSONResponse
 
 from llm_gateway.chat.ports import ProviderRejectedError, ProviderUnavailableError
 from llm_gateway.http.presenter import error_payload
+from llm_gateway.tenancy.auth import InvalidApiKeyError
+from llm_gateway.tenancy.ports import TenantStoreUnavailableError
 
 
 def register_error_handlers(app: FastAPI) -> None:
+    app.add_exception_handler(InvalidApiKeyError, _invalid_api_key)
+    app.add_exception_handler(TenantStoreUnavailableError, _tenant_store_unavailable)
     app.add_exception_handler(ProviderUnavailableError, _provider_unavailable)
     app.add_exception_handler(ProviderRejectedError, _provider_rejected)
     app.add_exception_handler(RequestValidationError, _invalid_request)
+
+
+async def _invalid_api_key(_: Request, error: Exception) -> JSONResponse:
+    # One message for every case: don't tell a caller which part of its key was wrong.
+    return JSONResponse(
+        error_payload("Invalid API key.", "invalid_request_error", "invalid_api_key"),
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def _tenant_store_unavailable(_: Request, error: Exception) -> JSONResponse:
+    return JSONResponse(
+        error_payload("Authentication is temporarily unavailable.", "service_unavailable"),
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
 
 
 async def _provider_unavailable(_: Request, error: Exception) -> JSONResponse:

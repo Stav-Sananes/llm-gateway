@@ -6,16 +6,20 @@ from contextlib import AbstractAsyncContextManager
 from fastapi import FastAPI
 
 from llm_gateway.chat.use_case import ChatCompletions
+from llm_gateway.http.auth import bearer_tenant
 from llm_gateway.http.errors import register_error_handlers
 from llm_gateway.http.routes import chat_router
+from llm_gateway.tenancy.auth import Authenticator
 
 Lifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
 
 
-def create_app(chat: ChatCompletions, lifespan: Lifespan | None = None) -> FastAPI:
+def create_app(
+    chat: ChatCompletions, authenticator: Authenticator, lifespan: Lifespan | None = None
+) -> FastAPI:
     app = FastAPI(title="LLM Gateway", lifespan=lifespan)
     register_error_handlers(app)
-    app.include_router(chat_router(chat))
+    app.include_router(chat_router(chat, bearer_tenant(authenticator)))
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

@@ -17,6 +17,10 @@ class TenantNotFoundError(Exception):
     """Tenant not found."""
 
 
+class TenantStoreUnavailableError(Exception):
+    """The tenant store could not be reached in time."""
+
+
 class KeyCacheUnavailableError(Exception):
     """The key cache could not be reached in time."""
 
@@ -43,7 +47,10 @@ class TenantStore(Protocol):
         ...
 
     async def tenant_for_key(self, key_hash: str) -> Tenant | None:
-        """Get the tenant owning this key, or None if the key is unknown or revoked."""
+        """Get the tenant owning this key, or None if the key is unknown or revoked.
+
+        Raises TenantStoreUnavailableError when the store can't be reached.
+        """
         ...
 
 
