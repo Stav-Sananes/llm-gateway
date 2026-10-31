@@ -71,6 +71,20 @@ async def test_unknown_key_hash_finds_no_tenant(store: TenantStore) -> None:
     assert await store.tenant_for_key(issue_key().key_hash) is None
 
 
+async def test_key_is_found_by_its_prefix_even_after_revoking(store: TenantStore) -> None:
+    tenant = a_tenant()
+    await store.add_tenant(tenant)
+    key = await add_key_for(store, tenant)
+
+    await store.revoke_key(key.prefix)
+
+    assert await store.key_with_prefix(key.prefix) == key
+
+
+async def test_unknown_prefix_finds_no_key(store: TenantStore) -> None:
+    assert await store.key_with_prefix("deadbeef") is None
+
+
 async def test_revoked_key_no_longer_finds_its_tenant(store: TenantStore) -> None:
     tenant = a_tenant()
     await store.add_tenant(tenant)

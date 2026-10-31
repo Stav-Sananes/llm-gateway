@@ -22,4 +22,10 @@ class Settings(BaseSettings):
     database_statement_timeout_s: float = 5.0
     database_pool_size: int = 10
 
+    redis_url: str = "redis://localhost:6379/0"
+    # Short: when Redis hangs, auth falls back to Postgres instead of waiting.
+    redis_timeout_s: float = 0.25
+    # Upper bound on how long a revoked key can keep working if its cache entry wasn't cleared.
+    key_cache_ttl_s: int = 60
+
     tracing_enabled: bool = False

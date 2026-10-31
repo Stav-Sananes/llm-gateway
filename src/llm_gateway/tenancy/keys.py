@@ -1,6 +1,10 @@
 import hashlib
+import re
 import secrets
 from dataclasses import dataclass
+
+# gw_ + 8 hex prefix + the 43 characters token_urlsafe(32) produces.
+_KEY_SHAPE = re.compile(r"gw_[0-9a-f]{8}_[A-Za-z0-9_-]{43}")
 
 
 @dataclass(frozen=True)
@@ -21,3 +25,8 @@ def issue_key() -> IssuedKey:
     secret = secrets.token_urlsafe(32)
     plaintext = f"gw_{prefix}_{secret}"
     return IssuedKey(plaintext=plaintext, prefix=prefix, key_hash=hash_key(plaintext))
+
+
+def looks_like_key(candidate: str) -> bool:
+    """Cheap shape check, so garbage tokens are refused without a cache or database lookup."""
+    return _KEY_SHAPE.fullmatch(candidate) is not None

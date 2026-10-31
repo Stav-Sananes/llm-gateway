@@ -39,6 +39,16 @@ class PostgresTenantStore:
                 )
             )
 
+    async def key_with_prefix(self, prefix: str) -> StoredKey | None:
+        query = select(api_keys.c.tenant_id, api_keys.c.prefix, api_keys.c.key_hash).where(
+            api_keys.c.prefix == prefix
+        )
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(query)).one_or_none()
+        if row is None:
+            return None
+        return StoredKey(tenant_id=row.tenant_id, prefix=row.prefix, key_hash=row.key_hash)
+
     async def revoke_key(self, prefix: str) -> None:
         # coalesce keeps the first revocation time if the key is revoked twice.
         statement = (

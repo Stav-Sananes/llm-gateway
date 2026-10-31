@@ -6,13 +6,19 @@ import sys
 from collections.abc import Sequence
 
 from llm_gateway.config import Settings
-from llm_gateway.main import build_engine, run
+from llm_gateway.main import build_engine, build_redis, run
+from llm_gateway.storage.key_cache import RedisKeyCache
 from llm_gateway.storage.migrate import upgrade_to_head
 from llm_gateway.storage.tenant_store import PostgresTenantStore
-from llm_gateway.tenancy.admin import TenantAdmin
+from llm_gateway.tenancy.admin import KeyCacheNotClearedError, TenantAdmin
 from llm_gateway.tenancy.ports import DuplicateTenantError, KeyNotFoundError, TenantNotFoundError
 
-ADMIN_ERRORS = (DuplicateTenantError, KeyNotFoundError, TenantNotFoundError)
+ADMIN_ERRORS = (
+    DuplicateTenantError,
+    KeyCacheNotClearedError,
+    KeyNotFoundError,
+    TenantNotFoundError,
+)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -44,13 +50,16 @@ def _parser() -> argparse.ArgumentParser:
 
 async def _admin(args: argparse.Namespace, settings: Settings) -> int:
     engine = build_engine(settings)
-    admin = TenantAdmin(PostgresTenantStore(engine))
+    redis = build_redis(settings)
+    cache = RedisKeyCache(redis, settings.key_cache_ttl_s)
+    admin = TenantAdmin(PostgresTenantStore(engine), cache)
     try:
         await _run_admin_action(admin, args)
     except ADMIN_ERRORS as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     finally:
+        await redis.aclose()
         await engine.dispose()
     return 0
 

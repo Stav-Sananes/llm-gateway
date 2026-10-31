@@ -7,11 +7,14 @@ services:
       GATEWAY_UPSTREAM_NAME: ollama
       GATEWAY_UPSTREAM_BASE_URL: http://ollama:11434/v1
       GATEWAY_DATABASE_URL: &database_url postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
+      GATEWAY_REDIS_URL: redis://redis:6379/0
       GATEWAY_TRACING_ENABLED: "true"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
       ollama-pull:
         condition: service_completed_successfully
       jaeger:
@@ -55,6 +58,15 @@ services:
     volumes: ["postgres:/var/lib/postgresql"]
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "gateway"]
+      interval: 2s
+      retries: 15
+
+  # API-key cache only: losing it costs a Postgres lookup, so no volume.
+  redis:
+    image: redis:8.10.3-alpine
+    ports: ["${REDIS_HOST_PORT:-6379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       retries: 15
 

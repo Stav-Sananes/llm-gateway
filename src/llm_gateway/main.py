@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from fastapi import FastAPI
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from llm_gateway import telemetry
@@ -39,6 +40,14 @@ def build_engine(settings: Settings) -> AsyncEngine:
             "timeout": settings.database_connect_timeout_s,
             "command_timeout": settings.database_statement_timeout_s,
         },
+    )
+
+
+def build_redis(settings: Settings) -> Redis:
+    return Redis.from_url(
+        settings.redis_url,
+        socket_connect_timeout=settings.redis_timeout_s,
+        socket_timeout=settings.redis_timeout_s,
     )
 
 
