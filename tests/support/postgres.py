@@ -26,4 +26,4 @@ def migrated_postgres() -> Iterator[str]:
 async def empty_tables(engine: AsyncEngine) -> None:
     """Clean at the start of each test, so a failed test leaves evidence behind."""
     async with engine.begin() as connection:
-        await connection.exec_driver_sql("TRUNCATE api_keys, tenants")
+        await connection.exec_driver_sql("TRUNCATE audit_events, audit_heads, api_keys, tenants")
