@@ -28,4 +28,12 @@ class Settings(BaseSettings):
     # Upper bound on how long a revoked key can keep working if its cache entry wasn't cleared.
     key_cache_ttl_s: int = 60
 
+    # Per tenant. The bucket holds `rate_limit_burst` requests and refills at the given rate.
+    rate_limit_burst: int = 20
+    rate_limit_per_s: float = 5.0
+    # Tokens (prompt + completion) per tenant per UTC day; None turns budgets off.
+    token_budget_per_day: int | None = 1_000_000
+    # Reserved for the completion when a request sets no max_tokens.
+    default_max_tokens: int = 1024
+
     tracing_enabled: bool = False

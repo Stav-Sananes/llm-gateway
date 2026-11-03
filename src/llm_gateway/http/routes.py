@@ -1,6 +1,6 @@
 """The OpenAI-compatible chat completions endpoint."""
 
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -10,19 +10,20 @@ from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.http.auth import TenantDependency
 from llm_gateway.http.presenter import ResponseIdentity, completion_payload, render_sse
 from llm_gateway.http.schemas import ChatCompletionBody
+from llm_gateway.tenancy.model import Tenant
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
-def chat_router(chat: ChatCompletions, tenant: TenantDependency) -> APIRouter:
-    router = APIRouter(dependencies=[Depends(tenant)])
+def chat_router(chat: ChatCompletions, authenticated: TenantDependency) -> APIRouter:
+    router = APIRouter()
 
     @router.post("/v1/chat/completions", response_model=None)
     async def create_chat_completion(
-        body: ChatCompletionBody,
+        body: ChatCompletionBody, tenant: Annotated[Tenant, Depends(authenticated)]
     ) -> StreamingResponse | dict[str, Any]:
         identity = ResponseIdentity.new(body.model)
-        chunks = chat.stream(body.to_domain())
+        chunks = await chat.start(body.to_domain(), tenant)
         if not body.stream:
             return completion_payload(identity, await collect(chunks))
 
