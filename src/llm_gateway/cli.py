@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from sqlalchemy.exc import SQLAlchemyError
 
 from llm_gateway.audit.log import AuditLog
+from llm_gateway.authz.cedar_engine import CedarPolicyEngine, PolicyFileError, load_policies
 from llm_gateway.config import Settings
 from llm_gateway.main import build_engine, build_redis, run
 from llm_gateway.storage.audit_store import PostgresAuditStore
@@ -35,6 +36,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("database is up to date")
     elif args.command == "audit":
         return asyncio.run(_verify_audit(args.tenant, settings))
+    elif args.command == "policy":
+        return _check_policies(args.file or settings.policy_file)
     else:
         return asyncio.run(_admin(args, settings))
     return 0
@@ -55,7 +58,22 @@ def _parser() -> argparse.ArgumentParser:
     audit = commands.add_parser("audit", help="check a tenant's audit chain")
     audit_actions = audit.add_subparsers(dest="action", required=True)
     audit_actions.add_parser("verify", help="recompute every hash").add_argument("tenant")
+
+    policy = commands.add_parser("policy", help="work with the Cedar tool-call policies")
+    policy_actions = policy.add_subparsers(dest="action", required=True)
+    check = policy_actions.add_parser("check", help="parse a policy file before deploying it")
+    check.add_argument("file", nargs="?", help="defaults to GATEWAY_POLICY_FILE or the built-ins")
     return parser
+
+
+def _check_policies(path: str | None) -> int:
+    try:
+        engine = CedarPolicyEngine(load_policies(path))
+    except (OSError, PolicyFileError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(f"ok: {len(engine.policy_names)} policies: {', '.join(engine.policy_names)}")
+    return 0
 
 
 async def _verify_audit(tenant_name: str, settings: Settings) -> int:
