@@ -1,7 +1,12 @@
 """Runtime settings, read from GATEWAY_* environment variables."""
 
-from pydantic import Field
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class RouteTarget(BaseModel):
+    provider: str
+    model: str
 
 
 class Settings(BaseSettings):
@@ -17,6 +22,21 @@ class Settings(BaseSettings):
     upstream_connect_timeout_s: float = 2.0
     upstream_read_timeout_s: float = 60.0
     upstream_max_connections: int = 100
+
+    # Anthropic is enabled when a key is set. The base URL is only overridden in tests.
+    anthropic_api_key: SecretStr | None = None
+    anthropic_base_url: str | None = None
+    # Let Anthropic re-run a refused request on a fallback model (supported models only).
+    anthropic_refusal_fallbacks: bool = True
+
+    # Model name → ordered provider targets, as JSON, e.g.
+    # {"smart": [{"provider": "anthropic", "model": "claude-opus-5-5"},
+    #            {"provider": "ollama", "model": "qwen2.5:0.5b"}]}
+    # Any other model name goes to `upstream_name` unchanged.
+    routes: dict[str, list[RouteTarget]] = Field(default_factory=dict)
+    # A provider's circuit opens after this many failures in a row, and is retried after reset.
+    breaker_failure_threshold: int = Field(default=5, gt=0)
+    breaker_reset_s: float = Field(default=30.0, gt=0)
 
     database_url: str = "postgresql+asyncpg://gateway:gateway@localhost:5433/gateway"
     database_connect_timeout_s: float = 2.0
