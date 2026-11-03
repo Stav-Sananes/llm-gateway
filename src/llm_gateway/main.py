@@ -11,22 +11,29 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from llm_gateway import telemetry
+from llm_gateway.audit.log import AuditLog
+from llm_gateway.authz.cedar_engine import CedarPolicyEngine, load_policies
 from llm_gateway.chat.ports import ChatProvider
 from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.config import Settings
 from llm_gateway.http.app import create_app
+from llm_gateway.http.mcp_endpoint import build_mcp_app, build_mcp_server
 from llm_gateway.limits.policies import FailOpenRateLimiter, UnlimitedBudget
 from llm_gateway.limits.ports import TokenBudget
 from llm_gateway.limits.token_bucket import InMemoryRateLimiter
 from llm_gateway.providers.anthropic import AnthropicProvider
+from llm_gateway.providers.mcp_upstreams import HttpMcpUpstreams
 from llm_gateway.providers.openai_compatible import OpenAICompatibleProvider
 from llm_gateway.routing.breaker import CircuitBreaker, GuardedProvider
 from llm_gateway.routing.router import Router, Target
+from llm_gateway.storage.audit_store import PostgresAuditStore
 from llm_gateway.storage.key_cache import RedisKeyCache
 from llm_gateway.storage.rate_limiter import RedisRateLimiter
 from llm_gateway.storage.tenant_store import PostgresTenantStore
 from llm_gateway.storage.token_budget import RedisTokenBudget
 from llm_gateway.tenancy.auth import Authenticator
+from llm_gateway.tools.gateway import ToolGateway
+from llm_gateway.tools.model import ToolLimits
 
 
 def build_upstream_client(settings: Settings) -> httpx.AsyncClient:
@@ -134,9 +141,20 @@ def build_app(settings: Settings) -> FastAPI:
         PostgresTenantStore(engine), RedisKeyCache(redis, settings.key_cache_ttl_s)
     )
 
+    # Loaded now, so a broken policy file stops the gateway from starting.
+    policy = CedarPolicyEngine(load_policies(settings.policy_file))
+    tools = ToolGateway(
+        HttpMcpUpstreams(settings.mcp_servers, settings.mcp_timeout_s),
+        policy,
+        AuditLog(PostgresAuditStore(engine)),
+        ToolLimits(settings.mcp_max_argument_bytes, settings.mcp_max_result_bytes),
+    )
+    mcp_app, mcp_sessions = build_mcp_app(build_mcp_server(tools), authenticator)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
+        async with mcp_sessions.run():
+            yield
         await upstream_client.aclose()
         if anthropic_client is not None:
             await anthropic_client.close()
@@ -146,7 +164,11 @@ def build_app(settings: Settings) -> FastAPI:
             tracer_provider.shutdown()
 
     app = create_app(
-        build_chat(settings, router, redis), authenticator, breakers, lifespan=lifespan
+        build_chat(settings, router, redis),
+        authenticator,
+        breakers,
+        lifespan=lifespan,
+        mcp_app=mcp_app,
     )
     if tracer_provider is not None:
         telemetry.instrument(app, upstream_client)

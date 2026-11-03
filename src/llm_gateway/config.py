@@ -40,6 +40,15 @@ class Settings(BaseSettings):
 
     # Cedar policies for MCP tool calls; unset uses the packaged demo policies.
     policy_file: str | None = None
+    # Upstream MCP servers behind /mcp, as JSON: {"sql": "http://sql:8000/mcp", ...}.
+    # Names become tool prefixes (`sql__query`), so they must not contain "__" or end in "_".
+    mcp_servers: dict[str, str] = Field(default_factory=dict)
+    # One deadline for each upstream MCP operation (connect, initialize, call).
+    mcp_timeout_s: float = Field(default=30.0, gt=0)
+    # Tool-call arguments over this are refused before the policy runs (parsing them is slow);
+    # results over the second limit are withheld from the client.
+    mcp_max_argument_bytes: int = Field(default=64 * 1024, gt=0)
+    mcp_max_result_bytes: int = Field(default=1024 * 1024, gt=0)
 
     database_url: str = "postgresql+asyncpg://gateway:gateway@localhost:5433/gateway"
     database_connect_timeout_s: float = 2.0

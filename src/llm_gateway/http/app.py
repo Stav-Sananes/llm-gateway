@@ -5,6 +5,8 @@ from contextlib import AbstractAsyncContextManager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from starlette.routing import Route
+from starlette.types import ASGIApp
 
 from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.http.auth import bearer_tenant
@@ -21,10 +23,17 @@ def create_app(
     authenticator: Authenticator,
     breakers: Sequence[CircuitBreaker] = (),
     lifespan: Lifespan | None = None,
+    mcp_app: ASGIApp | None = None,
 ) -> FastAPI:
     app = FastAPI(title="LLM Gateway", lifespan=lifespan)
     register_error_handlers(app)
     app.include_router(chat_router(chat, bearer_tenant(authenticator)))
+    if mcp_app is not None:
+        # A route, not a mount: clients use the exact URL /mcp, with no trailing slash.
+        # Starlette serves a non-function endpoint as a raw ASGI app. POST only: in stateless
+        # JSON mode GET (a server-to-client SSE stream that never closes) and DELETE (end a
+        # session) have nothing to serve, and an open GET stream would hold a task forever.
+        app.router.routes.append(Route("/mcp", endpoint=mcp_app, methods=["POST"]))
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
