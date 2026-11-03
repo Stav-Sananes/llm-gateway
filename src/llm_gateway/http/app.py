@@ -12,6 +12,7 @@ from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.http.auth import bearer_tenant
 from llm_gateway.http.errors import register_error_handlers
 from llm_gateway.http.routes import chat_router
+from llm_gateway.metrics import GatewayMetrics, HttpMetrics, metrics_endpoint
 from llm_gateway.routing.breaker import BreakerState, CircuitBreaker
 from llm_gateway.tenancy.auth import Authenticator
 
@@ -24,9 +25,13 @@ def create_app(
     breakers: Sequence[CircuitBreaker] = (),
     lifespan: Lifespan | None = None,
     mcp_app: ASGIApp | None = None,
+    metrics: GatewayMetrics | None = None,
 ) -> FastAPI:
     app = FastAPI(title="LLM Gateway", lifespan=lifespan)
     register_error_handlers(app)
+    if metrics is not None:
+        app.add_middleware(HttpMetrics, metrics=metrics)
+        app.router.routes.append(Route("/metrics", endpoint=metrics_endpoint(metrics)))
     app.include_router(chat_router(chat, bearer_tenant(authenticator)))
     if mcp_app is not None:
         # A route, not a mount: clients use the exact URL /mcp, with no trailing slash.

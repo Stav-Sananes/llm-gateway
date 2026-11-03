@@ -58,7 +58,7 @@ The domain core (routing, budgets, policy, audit) is written in a ports-and-adap
 ## Quickstart
 
 ```bash
-docker compose up -d --build     # gateway :8080, Jaeger UI :16686
+docker compose up -d --build     # gateway :8080, Jaeger :16686, Grafana :3000, Prometheus :9090
 
 # Every request needs an API key. The key is printed once; only its hash is stored.
 docker compose run --rm --no-deps gateway llm-gateway admin create-tenant acme

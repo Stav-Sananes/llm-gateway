@@ -1,4 +1,5 @@
-"""Command line: serve, migrate, administer tenants and keys, and verify audit chains."""
+"""Command line: serve, run the usage worker, migrate, administer tenants and keys, verify
+audit chains and check policies."""
 
 import argparse
 import asyncio
@@ -10,7 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from llm_gateway.audit.log import AuditLog
 from llm_gateway.authz.cedar_engine import CedarPolicyEngine, PolicyFileError, load_policies
 from llm_gateway.config import Settings
-from llm_gateway.main import build_engine, build_redis, run
+from llm_gateway.main import build_engine, build_redis, run, run_usage_worker
 from llm_gateway.storage.audit_store import PostgresAuditStore
 from llm_gateway.storage.key_cache import RedisKeyCache
 from llm_gateway.storage.migrate import upgrade_to_head
@@ -31,6 +32,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings = Settings()
     if args.command == "serve":
         run(settings)
+    elif args.command == "usage-worker":
+        asyncio.run(run_usage_worker(settings))
     elif args.command == "migrate":
         upgrade_to_head(settings.database_url)
         print("database is up to date")
@@ -48,6 +51,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("serve", help="run the gateway HTTP server")
     commands.add_parser("migrate", help="bring the database schema up to date")
+    commands.add_parser("usage-worker", help="write queued usage events to Postgres")
 
     admin = commands.add_parser("admin", help="manage tenants and API keys")
     actions = admin.add_subparsers(dest="action", required=True)

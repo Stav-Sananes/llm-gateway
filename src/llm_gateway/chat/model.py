@@ -30,10 +30,19 @@ class Usage:
 
 
 @dataclass(frozen=True)
+class Origin:
+    """Which provider and model produced the chunks from here on."""
+
+    provider: str
+    model: str
+
+
+@dataclass(frozen=True)
 class CompletionChunk:
     content: str = ""
     finish_reason: str | None = None
     usage: Usage | None = None
+    origin: Origin | None = None  # set by the router on the first chunk a provider serves
 
 
 @dataclass(frozen=True)

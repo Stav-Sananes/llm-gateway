@@ -19,6 +19,7 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi>=0.66b1",
     "opentelemetry-instrumentation-httpx>=0.66b1",
     "opentelemetry-sdk>=1.45.1",
+    "prometheus-client>=0.26.0",
     "pydantic-settings>=2.16.1",
     "redis>=8.1.0",
     "sqlalchemy[asyncio]>=2.1.6",

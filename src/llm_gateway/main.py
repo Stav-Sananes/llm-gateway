@@ -1,12 +1,18 @@
 """Composition root: the only place that knows concrete classes and wires them together."""
 
+import logging
+import signal
+import socket
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import anthropic
+import anyio
 import httpx
+import prometheus_client
 import uvicorn
 from fastapi import FastAPI
+from prometheus_client import CollectorRegistry
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -21,6 +27,7 @@ from llm_gateway.http.mcp_endpoint import build_mcp_app, build_mcp_server
 from llm_gateway.limits.policies import FailOpenRateLimiter, UnlimitedBudget
 from llm_gateway.limits.ports import TokenBudget
 from llm_gateway.limits.token_bucket import InMemoryRateLimiter
+from llm_gateway.metrics import CircuitStates, GatewayMetrics, MeteredUsage, WorkerMetrics
 from llm_gateway.providers.anthropic import AnthropicProvider
 from llm_gateway.providers.mcp_upstreams import HttpMcpUpstreams
 from llm_gateway.providers.openai_compatible import OpenAICompatibleProvider
@@ -31,9 +38,15 @@ from llm_gateway.storage.key_cache import RedisKeyCache
 from llm_gateway.storage.rate_limiter import RedisRateLimiter
 from llm_gateway.storage.tenant_store import PostgresTenantStore
 from llm_gateway.storage.token_budget import RedisTokenBudget
+from llm_gateway.storage.usage_store import PostgresUsageStore
+from llm_gateway.storage.usage_stream import RedisUsageQueue, RedisUsageStream
 from llm_gateway.tenancy.auth import Authenticator
 from llm_gateway.tools.gateway import ToolGateway
 from llm_gateway.tools.model import ToolLimits
+from llm_gateway.usage.ports import UsageRecorder
+from llm_gateway.usage.worker import UsageWorker
+
+logger = logging.getLogger(__name__)
 
 
 def build_upstream_client(settings: Settings) -> httpx.AsyncClient:
@@ -117,7 +130,9 @@ def build_redis(settings: Settings) -> Redis:
     )
 
 
-def build_chat(settings: Settings, provider: ChatProvider, redis: Redis) -> ChatCompletions:
+def build_chat(
+    settings: Settings, provider: ChatProvider, redis: Redis, usage: UsageRecorder
+) -> ChatCompletions:
     burst, per_s = settings.rate_limit_burst, settings.rate_limit_per_s
     rate_limiter = FailOpenRateLimiter(
         shared=RedisRateLimiter(redis, burst, per_s), local=InMemoryRateLimiter(burst, per_s)
@@ -127,7 +142,7 @@ def build_chat(settings: Settings, provider: ChatProvider, redis: Redis) -> Chat
         if settings.token_budget_per_day is None
         else RedisTokenBudget(redis, settings.token_budget_per_day)
     )
-    return ChatCompletions(provider, rate_limiter, budget, settings.default_max_tokens)
+    return ChatCompletions(provider, rate_limiter, budget, settings.default_max_tokens, usage)
 
 
 def build_app(settings: Settings) -> FastAPI:
@@ -163,12 +178,21 @@ def build_app(settings: Settings) -> FastAPI:
         if tracer_provider is not None:
             tracer_provider.shutdown()
 
+    metrics = GatewayMetrics(CollectorRegistry())
+    metrics.registry.register(CircuitStates(breakers))
+    usage = MeteredUsage(
+        metrics,
+        RedisUsageStream(
+            redis, settings.usage_stream_max_len, on_dropped=metrics.usage_events_dropped.inc
+        ),
+    )
     app = create_app(
-        build_chat(settings, router, redis),
+        build_chat(settings, router, redis, usage),
         authenticator,
         breakers,
         lifespan=lifespan,
         mcp_app=mcp_app,
+        metrics=metrics,
     )
     if tracer_provider is not None:
         telemetry.instrument(app, upstream_client)
@@ -177,3 +201,33 @@ def build_app(settings: Settings) -> FastAPI:
 
 def run(settings: Settings) -> None:
     uvicorn.run(build_app(settings), host=settings.host, port=settings.port)
+
+
+async def run_usage_worker(settings: Settings) -> None:
+    """The usage worker process: drain the usage stream into Postgres until SIGTERM/SIGINT.
+
+    Killed instead, nothing is lost: unacknowledged events are delivered again."""
+    registry = CollectorRegistry()
+    observer = WorkerMetrics(registry)
+    prometheus_client.start_http_server(settings.usage_worker_metrics_port, registry=registry)
+    block_s = 5
+    # Its own client: a blocking read waits block_s, past the gateway's short socket timeout.
+    redis = Redis.from_url(
+        settings.redis_url,
+        socket_connect_timeout=settings.redis_timeout_s,
+        socket_timeout=block_s + 5,
+    )
+    engine = build_engine(settings)
+    queue = RedisUsageQueue(redis, consumer=socket.gethostname(), block_ms=block_s * 1000)
+    worker = UsageWorker(queue, PostgresUsageStore(engine), observer=observer)
+    try:
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(worker.run)
+            with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGINT) as signals:
+                async for _ in signals:
+                    logger.info("usage worker stopping")
+                    tasks.cancel_scope.cancel()
+                    break
+    finally:
+        await redis.aclose()
+        await engine.dispose()
