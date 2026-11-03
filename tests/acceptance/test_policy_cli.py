@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from llm_gateway.authz.cedar_engine import CedarPolicyEngine, load_policies
 from llm_gateway.cli import main
 
 
@@ -13,11 +14,16 @@ def check(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, str, str
     return exit_code, out.strip(), err.strip()
 
 
-def test_the_built_in_policies_check_out(capsys: pytest.CaptureFixture[str]) -> None:
+def test_the_built_in_policies_check_out(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GATEWAY_POLICY_FILE", raising=False)
+    names = CedarPolicyEngine(load_policies(None)).policy_names
+
     exit_code, out, _ = check(capsys)
 
     assert exit_code == 0
-    assert out.startswith("ok: 5 policies: fs-move-needs-approval, ")
+    assert out == f"ok: {len(names)} policies: {', '.join(names)}"
 
 
 def test_a_broken_file_is_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

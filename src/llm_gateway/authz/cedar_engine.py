@@ -20,7 +20,7 @@ from typing import Any
 
 import cedarpy
 
-from llm_gateway.policy.facts import derive_facts
+from llm_gateway.policy.facts import UnsafeArgumentError, derive_facts
 from llm_gateway.policy.model import Decision, PolicyDecision, ToolCall
 
 
@@ -44,6 +44,7 @@ class CedarPolicyEngine:
         static = parsed.get("staticPolicies", {})
         if not static:
             raise PolicyFileError("no policies: every tool call would be denied")
+        _check_annotations(static)
         self._policies = policies
         # Cedar names policies policy0, policy1… by position; @id gives them readable names.
         self._names = {pid: p.get("annotations", {}).get("id", pid) for pid, p in static.items()}
@@ -58,7 +59,14 @@ class CedarPolicyEngine:
         return sorted(self._names.values())
 
     def decide(self, call: ToolCall) -> PolicyDecision:
-        result = cedarpy.is_authorized(_request(call), self._policies, _entities(call))
+        try:
+            request = _request(call)
+        except UnsafeArgumentError as error:
+            return PolicyDecision(Decision.DENY, (str(error),))
+        try:
+            result = cedarpy.is_authorized(request, self._policies, _entities(call))
+        except Exception as error:
+            return PolicyDecision(Decision.DENY, (f"policy engine error: {type(error).__name__}",))
         errors = list(result.diagnostics.errors)
         if errors:
             # A policy that errors is skipped by Cedar; a skipped forbid must not mean allow.
@@ -75,7 +83,7 @@ def _request(call: ToolCall) -> dict[str, Any]:
     return {
         "principal": f'Tenant::"{call.tenant_id}"',
         "action": 'Action::"call_tool"',
-        "resource": f"Tool::{json.dumps(call.qualified_name)}",
+        "resource": f"Tool::{json.dumps(call.qualified_name, ensure_ascii=False)}",
         "context": {"arguments": dict(call.arguments)} | derive_facts(call.arguments),
     }
 
@@ -93,3 +101,21 @@ def _entities(call: ToolCall) -> list[dict[str, Any]]:
             "parents": [],
         },
     ]
+
+
+def _check_annotations(static: dict[str, Any]) -> None:
+    """Annotation mistakes would otherwise change decisions silently."""
+    seen_ids: set[str] = set()
+    for pid, policy in static.items():
+        annotations = policy.get("annotations", {})
+        name = annotations.get("id", pid)
+        if name in seen_ids:
+            raise PolicyFileError(f"two policies share @id({name!r})")
+        seen_ids.add(name)
+        decision = annotations.get("decision")
+        if decision is None:
+            continue
+        if decision != Decision.REQUIRE_APPROVAL:
+            raise PolicyFileError(f"{name}: unknown @decision({decision!r})")
+        if policy.get("effect") != "permit":
+            raise PolicyFileError(f"{name}: @decision only applies to permit policies")
