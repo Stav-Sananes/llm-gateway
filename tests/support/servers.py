@@ -7,13 +7,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from starlette.types import ASGIApp
 
 STARTUP_TIMEOUT_S = 5.0
 
 
 @contextmanager
-def serving(app: FastAPI) -> Iterator[str]:
+def serving(app: ASGIApp) -> Iterator[str]:
     """Serve `app` on an ephemeral localhost port; yield its base URL."""
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))

@@ -13,6 +13,7 @@ dependencies = [
     "cedarpy>=4.12.2",
     "fastapi>=0.162.0",
     "httpx>=0.28.1",
+    "mcp>=2.3.0",
     "opentelemetry-api>=1.45.1",
     "opentelemetry-exporter-otlp-proto-http>=1.45.1",
     "opentelemetry-instrumentation-fastapi>=0.66b1",
