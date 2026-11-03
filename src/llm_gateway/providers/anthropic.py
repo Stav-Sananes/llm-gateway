@@ -4,6 +4,7 @@ Translates the gateway's OpenAI-shaped request into a Messages request, and the
 Messages stream events back into domain chunks. Nothing Anthropic-shaped leaves here.
 """
 
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -14,6 +15,8 @@ from llm_gateway.chat.model import ChatRequest, CompletionChunk, Message, Usage
 from llm_gateway.chat.ports import ChunkStream, ProviderRejectedError, ProviderUnavailableError
 from llm_gateway.providers.openai_compatible import UNAVAILABLE_STATUSES
 from llm_gateway.providers.tracing import record_usage, start_chat_span
+
+logger = logging.getLogger(__name__)
 
 # Models that take server-side refusal fallbacks in their "default" form.
 REFUSAL_FALLBACK_MODELS = frozenset(
@@ -27,6 +30,7 @@ _FINISH_REASONS = {
     "stop_sequence": "stop",
     "pause_turn": "stop",
     "max_tokens": "length",
+    "model_context_window_exceeded": "length",
     "tool_use": "tool_calls",
     "refusal": "content_filter",
 }
@@ -67,6 +71,9 @@ class AnthropicProvider:
             raise _translated(error) from error
         except anthropic.APIConnectionError as error:  # includes timeouts
             raise ProviderUnavailableError(f"anthropic unreachable: {error}") from error
+        except (anthropic.APIError, ValueError, AttributeError, KeyError) as error:
+            # Malformed stream data: the provider is broken, not the request.
+            raise ProviderUnavailableError(f"anthropic sent malformed data: {error}") from error
 
     async def _open(self, body: dict[str, Any]) -> Any:
         if self._refusal_fallbacks and body["model"] in REFUSAL_FALLBACK_MODELS:
@@ -94,20 +101,30 @@ def to_messages_request(request: ChatRequest, default_max_tokens: int) -> dict[s
 async def chunks_from(events: Any) -> ChunkStream:
     """Messages stream events → domain chunks: text deltas, the finish reason, then usage."""
     prompt_tokens = 0
+    wrote_text = False
     async for event in events:
         if event.type == "message_start":
             prompt_tokens = _prompt_tokens(event.message.usage)
+        elif event.type == "content_block_start" and event.content_block.type == "fallback":
+            # Anthropic declined and handed over to another model mid-message. What was
+            # already streamed can't be taken back; keep the two answers apart.
+            logger.warning("anthropic refusal fallback mid-stream")
+            if wrote_text:
+                yield CompletionChunk(content="\n\n")
         elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+            wrote_text = True
             yield CompletionChunk(content=event.delta.text)
         elif event.type == "message_delta":
+            # Prompt counts in message_delta are cumulative (they grow when Anthropic
+            # re-runs the request on a fallback model); prefer them when present.
+            prompt_tokens = _prompt_tokens(event.usage) or prompt_tokens
             stop_reason = event.delta.stop_reason
             yield CompletionChunk(finish_reason=_FINISH_REASONS.get(stop_reason or "", "stop"))
             # Output tokens include thinking, which the tenant pays for too.
-            yield CompletionChunk(
-                usage=Usage(
-                    prompt_tokens=prompt_tokens, completion_tokens=event.usage.output_tokens
-                )
-            )
+            completion_tokens = event.usage.output_tokens
+            yield CompletionChunk(usage=Usage(prompt_tokens, completion_tokens))
+            return
+    raise ProviderUnavailableError("anthropic stream ended before the message was finished")
 
 
 def _to_message(message: Message) -> dict[str, Any]:
@@ -157,7 +174,7 @@ def _text_of(message: Message) -> str:
 def _prompt_tokens(usage: Any) -> int:
     # Cached prompt tokens are reported separately; the prompt is all three.
     return int(
-        (usage.input_tokens or 0)
+        (getattr(usage, "input_tokens", 0) or 0)
         + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
         + (getattr(usage, "cache_read_input_tokens", 0) or 0)
     )

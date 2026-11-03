@@ -34,7 +34,7 @@ def create_app(
     async def readyz() -> JSONResponse:
         # Not ready only when no provider could take a request: every circuit is open.
         states = {breaker.name: breaker.state for breaker in breakers}
-        ready = any(state is not BreakerState.OPEN for state in states.values())
+        ready = not states or any(state is not BreakerState.OPEN for state in states.values())
         return JSONResponse(
             {"status": "ready" if ready else "unavailable", "providers": states},
             status_code=200 if ready else 503,

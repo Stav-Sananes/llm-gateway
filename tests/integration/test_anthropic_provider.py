@@ -25,7 +25,9 @@ def a_request(model: str = "claude-haiku-5-5", **fields: object) -> ChatRequest:
 
 
 @asynccontextmanager
-async def provider_at(base_url: str) -> AsyncIterator[AnthropicProvider]:
+async def provider_at(
+    base_url: str, refusal_fallbacks: bool = True
+) -> AsyncIterator[AnthropicProvider]:
     settings = Settings(
         anthropic_api_key=SecretStr("sk-test"),
         anthropic_base_url=base_url,
@@ -34,7 +36,9 @@ async def provider_at(base_url: str) -> AsyncIterator[AnthropicProvider]:
     client = build_anthropic_client(settings)
     assert client is not None
     try:
-        yield AnthropicProvider(client, default_max_tokens=4096)
+        yield AnthropicProvider(
+            client, default_max_tokens=4096, refusal_fallbacks=refusal_fallbacks
+        )
     finally:
         await client.close()  # its connection pool belongs to this test's event loop
 
@@ -99,7 +103,7 @@ async def test_refusal_is_a_content_filter_finish() -> None:
     assert completion.finish_reason == "content_filter"
 
 
-@pytest.mark.parametrize("status", [401, 429, 500, 529])
+@pytest.mark.parametrize("status", [401, 403, 408, 429, 500, 529])
 async def test_statuses_meaning_try_elsewhere_are_unavailable(status: int) -> None:
     async with fake(FakeAnthropicScript(fail_status=status)) as provider:
         with pytest.raises(ProviderUnavailableError):
@@ -151,3 +155,138 @@ async def test_hung_anthropic_is_given_up_on_after_the_read_timeout() -> None:
                 await complete(provider, a_request())
 
     assert time.monotonic() - started < 2.0  # read timeout 0.5 s, no SDK retries
+
+
+@pytest.mark.parametrize(
+    "script",
+    [FakeAnthropicScript(end_after_start=True), FakeAnthropicScript(garbage=True)],
+    ids=["ends-early", "not-json"],
+)
+async def test_a_truncated_or_garbled_stream_is_unavailable(script: FakeAnthropicScript) -> None:
+    async with fake(script) as provider:
+        with pytest.raises(ProviderUnavailableError):
+            await complete(provider, a_request())
+
+
+async def test_a_refusal_fallback_mid_message_keeps_the_two_answers_apart() -> None:
+    script = FakeAnthropicScript(
+        reply=("Partial", " answer", "Full answer."), fallback_after_chunks=2
+    )
+    async with fake(script) as provider:
+        completion = await complete(provider, a_request(model="claude-opus-5-5"))
+
+    assert completion.content == "Partial answer\n\nFull answer."
+
+
+async def test_cumulative_prompt_tokens_on_message_delta_win() -> None:
+    async with fake(FakeAnthropicScript(input_tokens=9, final_input_tokens=30)) as provider:
+        completion = await complete(provider, a_request())
+
+    assert completion.usage is not None
+    assert completion.usage.prompt_tokens == 30
+
+
+async def test_running_out_of_context_is_a_length_finish() -> None:
+    script = FakeAnthropicScript(stop_reason="model_context_window_exceeded")
+    async with fake(script) as provider:
+        completion = await complete(provider, a_request())
+
+    assert completion.finish_reason == "length"
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_system", "expected_messages"),
+    [
+        (
+            ({"role": "developer", "content": "Be brief."}, {"role": "user", "content": "hi"}),
+            "Be brief.",
+            [{"role": "user", "content": "hi"}],
+        ),
+        (
+            (
+                {"role": "system", "content": "One."},
+                {"role": "system", "content": [{"type": "text", "text": "Two."}]},
+                {"role": "user", "content": "hi"},
+            ),
+            "One.\n\nTwo.",
+            [{"role": "user", "content": "hi"}],
+        ),
+        (
+            (
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBO"}},
+                        {"type": "image_url", "image_url": {"url": "https://x.test/cat.png"}},
+                    ],
+                },
+            ),
+            None,
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"},
+                        },
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": "https://x.test/cat.png"},
+                        },
+                    ],
+                }
+            ],
+        ),
+    ],
+    ids=["developer-role", "several-system-messages", "text-and-images"],
+)
+async def test_translates_openai_messages_to_the_messages_api(
+    messages: tuple[dict[str, object], ...],
+    expected_system: str | None,
+    expected_messages: list[dict[str, object]],
+) -> None:
+    log = FakeAnthropicLog()
+    async with fake(FakeAnthropicScript(), log) as provider:
+        await complete(provider, a_request(messages=messages))
+
+    [sent] = log.requests
+    assert sent.get("system") == expected_system
+    assert sent["messages"] == expected_messages
+
+
+async def test_a_request_without_max_tokens_sends_the_default() -> None:
+    log = FakeAnthropicLog()
+    request = ChatRequest(model="claude-haiku-5-5", messages=HI)
+    async with fake(FakeAnthropicScript(), log) as provider:
+        await complete(provider, request)
+
+    assert log.requests[0]["max_tokens"] == 4096
+
+
+async def test_prompt_tokens_include_cached_tokens() -> None:
+    script = FakeAnthropicScript(input_tokens=9, cache_read_tokens=100, cache_creation_tokens=20)
+    async with fake(script) as provider:
+        completion = await complete(provider, a_request())
+
+    assert completion.usage is not None
+    assert completion.usage.prompt_tokens == 129
+
+
+async def test_hitting_max_tokens_is_a_length_finish() -> None:
+    async with fake(FakeAnthropicScript(stop_reason="max_tokens")) as provider:
+        completion = await complete(provider, a_request())
+
+    assert completion.finish_reason == "length"
+
+
+async def test_refusal_fallbacks_can_be_switched_off() -> None:
+    log = FakeAnthropicLog()
+    with serving(create_fake_anthropic(FakeAnthropicScript(), log)) as url:
+        async with provider_at(url, refusal_fallbacks=False) as provider:
+            await complete(provider, a_request(model="claude-opus-5-5"))
+
+    assert "fallbacks" not in log.requests[0]
+    assert "anthropic-beta" not in log.headers[0]

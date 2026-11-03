@@ -1,6 +1,7 @@
 """Renders domain chunks and completions in the OpenAI wire format."""
 
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -10,7 +11,11 @@ from typing import Any
 from llm_gateway.chat.model import Completion, CompletionChunk, Usage
 from llm_gateway.chat.ports import ChunkStream, ProviderUnavailableError
 
+logger = logging.getLogger(__name__)
+
 DONE_EVENT = "data: [DONE]\n\n"
+# What clients see when providers fail; which provider failed and why is only logged.
+UPSTREAM_UNAVAILABLE = "The model provider is unavailable. Try again later."
 
 
 @dataclass(frozen=True)
@@ -46,7 +51,8 @@ async def render_sse(
             if chunk.content or chunk.finish_reason:
                 yield _sse(chunk_payload(identity, chunk, is_first=False))
     except ProviderUnavailableError as error:
-        yield _sse(error_payload(str(error), "upstream_error"))
+        logger.error("provider failed mid-stream: %s", error)
+        yield _sse(error_payload(UPSTREAM_UNAVAILABLE, "upstream_error"))
         return
     finally:
         await rest.aclose()

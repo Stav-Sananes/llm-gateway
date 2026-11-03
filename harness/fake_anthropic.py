@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 _ERROR_TYPES = {
     400: "invalid_request_error",
     401: "authentication_error",
+    403: "permission_error",
+    408: "timeout_error",
     404: "not_found_error",
     429: "rate_limit_error",
     500: "api_error",
@@ -32,6 +34,12 @@ class FakeAnthropicScript:
     fail_message: str = "scripted failure"
     error_after_chunks: int | None = None  # send an overloaded `error` event after N deltas
     token_delay_s: float = 0.0
+    end_after_start: bool = False  # connection closes cleanly right after message_start
+    garbage: bool = False  # a data line that isn't JSON
+    fallback_after_chunks: int | None = None  # a refusal fallback block after N deltas
+    final_input_tokens: int | None = None  # cumulative input_tokens on message_delta
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 @dataclass
@@ -62,6 +70,11 @@ def create_fake_anthropic(
 
 async def _events(script: FakeAnthropicScript, model: str) -> AsyncIterator[str]:
     yield _event("message_start", {"type": "message_start", "message": _message(model, script)})
+    if script.end_after_start:
+        return
+    if script.garbage:
+        yield "event: content_block_delta\ndata: {not json\n\n"
+        return
     yield _event(
         "content_block_start",
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
@@ -70,6 +83,12 @@ async def _events(script: FakeAnthropicScript, model: str) -> AsyncIterator[str]
         if index == script.error_after_chunks:
             yield _event("error", _error(529, "Overloaded"))
             return
+        if index == script.fallback_after_chunks:
+            yield _event("content_block_stop", {"type": "content_block_stop", "index": 0})
+            yield _event(
+                "content_block_start",
+                {"type": "content_block_start", "index": 1, "content_block": _fallback_block()},
+            )
         await asyncio.sleep(script.token_delay_s)
         yield _event(
             "content_block_delta",
@@ -85,7 +104,12 @@ async def _events(script: FakeAnthropicScript, model: str) -> AsyncIterator[str]
         {
             "type": "message_delta",
             "delta": {"stop_reason": script.stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": len(script.reply)},
+            "usage": {"output_tokens": len(script.reply)}
+            | (
+                {}
+                if script.final_input_tokens is None
+                else {"input_tokens": script.final_input_tokens}
+            ),
         },
     )
     yield _event("message_stop", {"type": "message_stop"})
@@ -100,7 +124,20 @@ def _message(model: str, script: FakeAnthropicScript) -> dict[str, Any]:
         "content": [],
         "stop_reason": None,
         "stop_sequence": None,
-        "usage": {"input_tokens": script.input_tokens, "output_tokens": 1},
+        "usage": {
+            "input_tokens": script.input_tokens,
+            "output_tokens": 1,
+            "cache_read_input_tokens": script.cache_read_tokens,
+            "cache_creation_input_tokens": script.cache_creation_tokens,
+        },
+    }
+
+
+def _fallback_block() -> dict[str, Any]:
+    return {
+        "type": "fallback",
+        "from": {"model": "claude-opus-5-5"},
+        "to": {"model": "claude-opus-4-8"},
     }
 
 

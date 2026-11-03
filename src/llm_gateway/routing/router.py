@@ -45,14 +45,13 @@ class Router:
             chunks = self._providers[target.provider].stream(replace(request, model=target.model))
             try:
                 first = await anext(chunks)
-            except StopAsyncIteration:
-                return
-            except ProviderUnavailableError as error:
+            except (StopAsyncIteration, ProviderUnavailableError) as error:
                 await chunks.aclose()
+                reason = str(error) or "returned an empty stream"
                 logger.warning(
-                    "%s/%s unavailable, trying next: %s", target.provider, target.model, error
+                    "%s/%s unavailable, trying next: %s", target.provider, target.model, reason
                 )
-                failures.append(f"{target.provider}: {error}")
+                failures.append(f"{target.provider}: {reason}")
                 continue
             try:
                 yield first

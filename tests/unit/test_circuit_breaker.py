@@ -4,7 +4,7 @@ import pytest
 
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, collect
 from llm_gateway.chat.ports import ChunkStream, ProviderRejectedError, ProviderUnavailableError
-from llm_gateway.routing.breaker import BreakerState, CircuitBreaker, GuardedProvider
+from llm_gateway.routing.breaker import BreakerState, CircuitBreaker, GuardedProvider, Permit
 from tests.support.providers import ScriptedProvider
 
 pytestmark = pytest.mark.anyio
@@ -28,12 +28,12 @@ def a_breaker(clock: FakeClock, threshold: int = 2, reset_after_s: float = 10.0)
 def test_opens_after_the_threshold_of_failures_in_a_row() -> None:
     breaker = a_breaker(FakeClock())
     breaker.record_failure()
-    assert breaker.try_acquire()  # one failure: still closed
+    assert breaker.try_acquire() is Permit.NORMAL  # one failure: still closed
 
     breaker.record_failure()
 
     assert breaker.state is BreakerState.OPEN
-    assert not breaker.try_acquire()
+    assert breaker.try_acquire() is None
 
 
 def test_a_success_resets_the_failure_count() -> None:
@@ -55,8 +55,8 @@ def test_half_open_after_the_reset_time_lets_one_trial_through() -> None:
     clock.now += 10
 
     assert breaker.state is BreakerState.HALF_OPEN
-    assert breaker.try_acquire()
-    assert not breaker.try_acquire()  # one trial at a time
+    assert breaker.try_acquire() is Permit.TRIAL
+    assert breaker.try_acquire() is None  # one trial at a time
 
 
 def test_a_successful_trial_closes_the_circuit() -> None:
@@ -138,4 +138,39 @@ async def test_a_trial_abandoned_before_any_output_frees_the_next_trial() -> Non
         await asyncio.wait_for(anext(trial), timeout=0.05)  # the client left
     await trial.aclose()
 
-    assert breaker.try_acquire()
+    assert breaker.try_acquire() is Permit.TRIAL
+
+
+def test_an_older_call_ending_does_not_free_the_running_trial() -> None:
+    clock = FakeClock()
+    breaker = a_breaker(clock, threshold=1)
+    older = breaker.try_acquire()  # started while closed
+    breaker.record_failure()
+    clock.now += 10
+    assert breaker.try_acquire() is Permit.TRIAL
+    assert older is not None
+
+    breaker.release(older)  # the older call ends without an answer
+
+    assert breaker.try_acquire() is None
+
+
+async def test_a_trial_that_streams_closes_the_circuit() -> None:
+    clock = FakeClock()
+    breaker = a_breaker(clock, threshold=1)
+    breaker.record_failure()
+    clock.now += 10
+
+    await collect(GuardedProvider(ScriptedProvider(OK), breaker).stream(REQUEST))
+
+    assert breaker.state is BreakerState.CLOSED
+
+
+async def test_a_provider_failing_after_its_first_chunk_still_counts_as_a_failure() -> None:
+    breaker = a_breaker(FakeClock(), threshold=1)
+    guarded = GuardedProvider(ScriptedProvider(OK, fail_after=True), breaker)
+
+    with pytest.raises(ProviderUnavailableError):
+        await collect(guarded.stream(REQUEST))
+
+    assert breaker.state is BreakerState.OPEN

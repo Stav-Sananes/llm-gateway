@@ -45,6 +45,7 @@ class OpenAICompatibleProvider:
                         return
                     if data:
                         yield parse_chunk(json.loads(data))
+            raise ProviderUnavailableError(f"{self._provider_name} stream ended without [DONE]")
         except httpx.TimeoutException as error:
             raise ProviderUnavailableError(f"{self._provider_name} timed out") from error
         except httpx.TransportError as error:

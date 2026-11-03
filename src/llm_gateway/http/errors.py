@@ -8,7 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from llm_gateway.chat.ports import ProviderRejectedError, ProviderUnavailableError
-from llm_gateway.http.presenter import error_payload
+from llm_gateway.http.presenter import UPSTREAM_UNAVAILABLE, error_payload
 from llm_gateway.limits.ports import (
     BudgetExhaustedError,
     BudgetUnavailableError,
@@ -82,8 +82,10 @@ async def _budget_unavailable(_: Request, error: Exception) -> JSONResponse:
 
 
 async def _provider_unavailable(_: Request, error: Exception) -> JSONResponse:
+    logger.error("no provider could serve the request: %s", error)
     return JSONResponse(
-        error_payload(str(error), "upstream_error"), status_code=status.HTTP_502_BAD_GATEWAY
+        error_payload(UPSTREAM_UNAVAILABLE, "upstream_error"),
+        status_code=status.HTTP_502_BAD_GATEWAY,
     )
 
 

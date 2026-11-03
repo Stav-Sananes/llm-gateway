@@ -8,7 +8,7 @@ closed ──N failures in a row──► open ──reset_after_s──► half
 import logging
 import time
 from collections.abc import Callable
-from enum import StrEnum
+from enum import Enum, StrEnum
 
 from llm_gateway.chat.model import ChatRequest
 from llm_gateway.chat.ports import ChatProvider, ChunkStream, ProviderUnavailableError
@@ -22,6 +22,11 @@ class BreakerState(StrEnum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
+
+
+class Permit(Enum):
+    NORMAL = "normal"
+    TRIAL = "trial"
 
 
 class CircuitBreaker:
@@ -48,15 +53,15 @@ class CircuitBreaker:
             return BreakerState.HALF_OPEN
         return BreakerState.OPEN
 
-    def try_acquire(self) -> bool:
+    def try_acquire(self) -> Permit | None:
         """May a call go through now? In half-open, only one trial call at a time."""
         state = self.state
         if state is BreakerState.CLOSED:
-            return True
+            return Permit.NORMAL
         if state is BreakerState.HALF_OPEN and not self._trial_running:
             self._trial_running = True
-            return True
-        return False
+            return Permit.TRIAL
+        return None
 
     def record_success(self) -> None:
         if self._opened_at is not None:
@@ -71,9 +76,13 @@ class CircuitBreaker:
             # (Re)open: a failed trial starts the wait over.
             self._opened_at, self._trial_running = self._clock(), False
 
-    def release(self) -> None:
-        """A call ended without telling us anything (the client left early): free the trial."""
-        self._trial_running = False
+    def release(self, permit: Permit) -> None:
+        """A call ended without telling us anything (the client left early).
+
+        Only the trial's own call frees the trial; an older call ending says nothing about it.
+        """
+        if permit is Permit.TRIAL:
+            self._trial_running = False
 
 
 class GuardedProvider:
@@ -84,7 +93,8 @@ class GuardedProvider:
         self.breaker = breaker
 
     async def stream(self, request: ChatRequest) -> ChunkStream:
-        if not self.breaker.try_acquire():
+        permit = self.breaker.try_acquire()
+        if permit is None:
             raise ProviderUnavailableError(f"{self.breaker.name} circuit is open")
         chunks = self._provider.stream(request)
         answered = False
@@ -100,4 +110,4 @@ class GuardedProvider:
         finally:
             await chunks.aclose()
             if not answered:
-                self.breaker.release()
+                self.breaker.release(permit)

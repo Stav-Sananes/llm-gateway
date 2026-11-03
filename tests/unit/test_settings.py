@@ -15,3 +15,7 @@ def test_limits_must_be_positive(field: str) -> None:
 
 def test_budgets_can_be_switched_off() -> None:
     assert Settings(token_budget_per_day=None).token_budget_per_day is None
+
+
+def test_a_blank_anthropic_key_means_anthropic_is_off() -> None:
+    assert Settings.model_validate({"anthropic_api_key": ""}).anthropic_api_key is None

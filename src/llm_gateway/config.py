@@ -1,6 +1,6 @@
 """Runtime settings, read from GATEWAY_* environment variables."""
 
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -58,3 +58,9 @@ class Settings(BaseSettings):
     default_max_tokens: int = Field(default=4096, gt=0)
 
     tracing_enabled: bool = False
+
+    @field_validator("anthropic_api_key", mode="before")
+    @classmethod
+    def _blank_key_means_none(cls, value: object) -> object:
+        # Compose passes `${ANTHROPIC_API_KEY:-}` as an empty string when it's unset.
+        return None if value == "" else value

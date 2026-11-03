@@ -51,7 +51,8 @@ def build_anthropic_client(settings: Settings) -> anthropic.AsyncAnthropic | Non
         timeout=anthropic.Timeout(
             connect=settings.upstream_connect_timeout_s,
             read=settings.upstream_read_timeout_s,
-            write=settings.upstream_connect_timeout_s,
+            # Sending a request with images can take longer than connecting.
+            write=settings.upstream_read_timeout_s,
             pool=settings.upstream_connect_timeout_s,
         ),
         # The router falls back to the next provider; SDK retries would only add latency.
@@ -68,6 +69,8 @@ def build_router(
         settings.upstream_name: OpenAICompatibleProvider(upstream_client, settings.upstream_name)
     }
     if anthropic_client is not None:
+        if "anthropic" in providers:
+            raise ValueError("GATEWAY_UPSTREAM_NAME must not be 'anthropic'; that name is taken")
         providers["anthropic"] = AnthropicProvider(
             anthropic_client, settings.default_max_tokens, settings.anthropic_refusal_fallbacks
         )

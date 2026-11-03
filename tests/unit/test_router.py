@@ -48,6 +48,14 @@ async def test_falls_back_when_a_target_is_unavailable_before_its_first_chunk() 
     assert a.closed
 
 
+async def test_falls_back_when_a_target_answers_with_an_empty_stream() -> None:
+    a, b = ScriptedProvider(()), ScriptedProvider(FROM_B)
+
+    completion = await collect(router(a, b).stream(a_request("smart")))
+
+    assert completion.content == "from b"
+
+
 async def test_does_not_fall_back_once_a_target_has_streamed() -> None:
     a, b = ScriptedProvider(FROM_A, fail_after=True), ScriptedProvider(FROM_B)
 

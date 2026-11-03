@@ -1,5 +1,6 @@
 """Routing, fallback and circuit breakers end to end: fake Anthropic in front of a fake LLM."""
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -73,7 +74,7 @@ def test_streaming_through_anthropic_ends_with_usage_and_done(services: Settings
         lines = [line for line in answer(client, body).iter_lines() if line.startswith("data: ")]
 
     assert lines[-1] == "data: [DONE]"
-    assert '"total_tokens":13' in lines[-2]  # 9 prompt + 4 completion
+    assert json.loads(lines[-2].removeprefix("data: "))["usage"]["total_tokens"] == 13  # 9 + 4
 
 
 def test_anthropic_overloaded_falls_back_to_the_next_target(services: Settings) -> None:
@@ -84,6 +85,22 @@ def test_anthropic_overloaded_falls_back_to_the_next_target(services: Settings) 
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == FALLBACK_TEXT
     assert [r["model"] for r in fallback_log.requests] == ["qwen2.5:0.5b"]
+
+
+def test_an_error_event_before_any_text_falls_back(services: Settings) -> None:
+    with gateway(services, FakeAnthropicScript(error_after_chunks=0)) as client:
+        response = answer(client)
+
+    assert response.json()["choices"][0]["message"]["content"] == FALLBACK_TEXT
+
+
+def test_refusal_fallbacks_setting_reaches_the_adapter(services: Settings) -> None:
+    claude_log = FakeAnthropicLog()
+    off = services.model_copy(update={"anthropic_refusal_fallbacks": False})
+    with gateway(off, FakeAnthropicScript(), claude_log) as client:
+        answer(client)
+
+    assert "fallbacks" not in claude_log.requests[0]
 
 
 def test_after_repeated_failures_the_circuit_opens_and_anthropic_is_skipped(
