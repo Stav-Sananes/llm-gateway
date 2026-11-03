@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     breaker_failure_threshold: int = Field(default=5, gt=0)
     breaker_reset_s: float = Field(default=30.0, gt=0)
 
+    # Cedar policies for MCP tool calls; unset uses the packaged demo policies.
+    policy_file: str | None = None
+
     database_url: str = "postgresql+asyncpg://gateway:gateway@localhost:5433/gateway"
     database_connect_timeout_s: float = 2.0
     database_statement_timeout_s: float = 5.0
