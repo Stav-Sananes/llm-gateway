@@ -115,7 +115,9 @@ def test_health_check_needs_no_key(services: Settings) -> None:
 
 def test_redis_down_still_serves_valid_keys_from_postgres(services: Settings) -> None:
     api_key = new_api_key(services)
-    with gateway(with_unreachable_redis(services)) as client:
+    # Budgets fail closed without Redis (see test_limits.py); switch them off to isolate auth.
+    no_budget = services.model_copy(update={"token_budget_per_day": None})
+    with gateway(with_unreachable_redis(no_budget)) as client:
         assert chat(client, api_key).status_code == 200
 
 

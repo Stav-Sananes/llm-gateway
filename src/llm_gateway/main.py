@@ -10,12 +10,18 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from llm_gateway import telemetry
+from llm_gateway.chat.ports import ChatProvider
 from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.config import Settings
 from llm_gateway.http.app import create_app
+from llm_gateway.limits.policies import FailOpenRateLimiter, UnlimitedBudget
+from llm_gateway.limits.ports import TokenBudget
+from llm_gateway.limits.token_bucket import InMemoryRateLimiter
 from llm_gateway.providers.openai_compatible import OpenAICompatibleProvider
 from llm_gateway.storage.key_cache import RedisKeyCache
+from llm_gateway.storage.rate_limiter import RedisRateLimiter
 from llm_gateway.storage.tenant_store import PostgresTenantStore
+from llm_gateway.storage.token_budget import RedisTokenBudget
 from llm_gateway.tenancy.auth import Authenticator
 
 
@@ -54,6 +60,19 @@ def build_redis(settings: Settings) -> Redis:
     )
 
 
+def build_chat(settings: Settings, provider: ChatProvider, redis: Redis) -> ChatCompletions:
+    burst, per_s = settings.rate_limit_burst, settings.rate_limit_per_s
+    rate_limiter = FailOpenRateLimiter(
+        shared=RedisRateLimiter(redis, burst, per_s), local=InMemoryRateLimiter(burst, per_s)
+    )
+    budget: TokenBudget = (
+        UnlimitedBudget()
+        if settings.token_budget_per_day is None
+        else RedisTokenBudget(redis, settings.token_budget_per_day)
+    )
+    return ChatCompletions(provider, rate_limiter, budget, settings.default_max_tokens)
+
+
 def build_app(settings: Settings) -> FastAPI:
     tracer_provider = telemetry.install_tracer_provider() if settings.tracing_enabled else None
     upstream_client = build_upstream_client(settings)
@@ -73,7 +92,7 @@ def build_app(settings: Settings) -> FastAPI:
         if tracer_provider is not None:
             tracer_provider.shutdown()
 
-    app = create_app(ChatCompletions(provider), authenticator, lifespan=lifespan)
+    app = create_app(build_chat(settings, provider, redis), authenticator, lifespan=lifespan)
     if tracer_provider is not None:
         telemetry.instrument(app, upstream_client)
     return app
