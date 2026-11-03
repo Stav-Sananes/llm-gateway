@@ -1,6 +1,7 @@
 """`llm-gateway audit verify`: what an operator runs to check a tenant's audit trail."""
 
 import asyncio
+import re
 
 import pytest
 
@@ -26,6 +27,19 @@ def record_three_events(settings: Settings, tenant_name: str) -> None:
             await engine.dispose()
 
     asyncio.run(record())
+
+
+def head_hash(settings: Settings, tenant_name: str) -> str:
+    async def read() -> str:
+        engine = build_engine(settings)
+        try:
+            tenant = await PostgresTenantStore(engine).tenant_named(tenant_name)
+            assert tenant is not None
+            return (await PostgresAuditStore(engine).head(tenant.id)).hash
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
 
 
 def tamper(settings: Settings, sql: str) -> None:
@@ -55,7 +69,8 @@ def test_an_intact_chain_reports_ok_and_its_head(
     exit_code, out, _ = verify(capsys, "acme")
 
     assert exit_code == 0
-    assert out.startswith("ok: 3 records, head ")
+    assert re.fullmatch(r"ok: 3 records, head [0-9a-f]{64}", out)
+    assert out.endswith(head_hash(services, "acme"))
 
 
 def test_an_edited_chain_is_reported_and_exits_2(

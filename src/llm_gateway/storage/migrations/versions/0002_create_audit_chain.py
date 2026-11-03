@@ -42,6 +42,7 @@ def upgrade() -> None:
             ["tenant_id"], ["tenants.id"], name="fk_audit_events_tenant_id_tenants"
         ),
         sa.PrimaryKeyConstraint("tenant_id", "seq", name="pk_audit_events"),
+        sa.CheckConstraint("seq > 0", name="ck_audit_events_seq_positive"),
     )
 
 

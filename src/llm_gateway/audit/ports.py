@@ -20,8 +20,8 @@ class AuditStore(Protocol):
         """
         ...
 
-    def records(self, tenant_id: UUID) -> AsyncIterator[AuditRecord]:
-        """The tenant's records in seq order, read in bounded batches."""
+    def records(self, tenant_id: UUID, up_to_seq: int) -> AsyncIterator[AuditRecord]:
+        """The tenant's records with seq <= up_to_seq, in seq order, read in bounded batches."""
         ...
 
     async def head(self, tenant_id: UUID) -> ChainHead:

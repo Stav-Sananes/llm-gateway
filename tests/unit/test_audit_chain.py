@@ -1,12 +1,16 @@
 import hashlib
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
+
+import pytest
 
 from llm_gateway.audit.chain import (
     EMPTY_CHAIN,
     GENESIS_HASH,
     AuditEvent,
     ChainHead,
+    UnauditableEventError,
     canonical,
     link_hash,
     next_record,
@@ -53,3 +57,20 @@ def test_each_hash_depends_on_the_previous_one() -> None:
 
 def test_link_hash_is_sha256_of_previous_hash_bytes_then_payload() -> None:
     assert link_hash(GENESIS_HASH, "x") == hashlib.sha256(bytes(32) + b"x").hexdigest()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["\ud800", Decimal("1.10"), datetime(2026, 1, 1, tzinfo=UTC), b"bytes", "café"],
+    ids=["lone-surrogate", "decimal", "datetime", "bytes", "non-ascii"],
+)
+def test_awkward_values_still_render_canonically(value: object) -> None:
+    rendered = canonical(an_event({"v": value}))
+
+    assert rendered.isascii()
+    rendered.encode("utf-8")
+
+
+def test_an_unrenderable_value_is_a_typed_error() -> None:
+    with pytest.raises(UnauditableEventError):
+        canonical(an_event({"n": 10**5000}))

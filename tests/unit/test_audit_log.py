@@ -1,8 +1,11 @@
 import asyncio
+import json
+from datetime import datetime, timedelta
 from uuid import UUID
 
 import pytest
 
+from llm_gateway.audit.chain import GENESIS_HASH, UnauditableEventError
 from llm_gateway.audit.log import AuditLog
 from llm_gateway.audit.redaction import REDACTED
 from tests.support.in_memory_audit_store import InMemoryAuditStore
@@ -20,11 +23,13 @@ async def a_chain(store: InMemoryAuditStore, length: int) -> AuditLog:
 
 
 async def test_an_untouched_chain_verifies() -> None:
-    log = await a_chain(InMemoryAuditStore(), 5)
+    store = InMemoryAuditStore()
+    log = await a_chain(store, 5)
 
     result = await log.verify(ACME)
 
     assert (result.ok, result.checked, result.problem) == (True, 5, None)
+    assert result.head_hash == (await store.head(ACME)).hash != GENESIS_HASH
 
 
 async def test_an_empty_chain_verifies() -> None:
@@ -89,4 +94,29 @@ async def test_concurrent_records_form_one_unbroken_chain() -> None:
 
     await asyncio.gather(*(log.record(ACME, "tool.called", {"n": n}) for n in range(30)))
 
-    assert (await log.verify(ACME)).checked == 30
+    result = await log.verify(ACME)
+    assert (result.ok, result.checked) == (True, 30)
+
+
+async def test_extra_secret_keys_are_redacted() -> None:
+    record = await AuditLog(InMemoryAuditStore(), secret_keys=["ssn"]).record(
+        ACME, "a", {"ssn": "123-45-6789"}
+    )
+
+    assert "123-45-6789" not in record.payload
+
+
+async def test_an_unrenderable_event_never_reaches_the_store() -> None:
+    store = InMemoryAuditStore()
+
+    with pytest.raises(UnauditableEventError):
+        await AuditLog(store).record(ACME, "a", {"n": 10**5000})
+
+    assert (await store.head(ACME)).seq == 0
+
+
+async def test_events_are_timestamped_in_utc() -> None:
+    record = await AuditLog(InMemoryAuditStore()).record(ACME, "a", {})
+
+    occurred_at = datetime.fromisoformat(json.loads(record.payload)["occurred_at"])
+    assert occurred_at.utcoffset() == timedelta(0)

@@ -46,15 +46,26 @@ class AuditRecord:
 EMPTY_CHAIN = ChainHead(seq=0, hash=GENESIS_HASH)
 
 
+class UnauditableEventError(ValueError):
+    """The event can't be rendered canonically (e.g. a non-string key, an absurdly long int)."""
+
+
 def canonical(event: AuditEvent) -> str:
-    """One stable text per event: sorted keys, no spaces, UTC ISO time. Hash input and storage."""
+    """One stable text per event: sorted keys, no spaces, UTC ISO time. Hash input and storage.
+
+    ASCII-only (non-ASCII is \\u-escaped) so any string, even a lone surrogate, encodes;
+    values JSON can't represent (dates, decimals, bytes) are written as their str().
+    """
     document = {
         "action": event.action,
         "details": event.details,
         "occurred_at": event.occurred_at.isoformat(),
         "tenant_id": str(event.tenant_id),
     }
-    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    try:
+        return json.dumps(document, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError) as error:
+        raise UnauditableEventError(str(error)) from error
 
 
 def link_hash(prev_hash: str, payload: str) -> str:

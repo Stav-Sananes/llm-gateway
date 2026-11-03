@@ -41,12 +41,16 @@ class PostgresAuditStore:
             raise AuditUnavailableError(type(error).__name__) from error
         return record
 
-    async def records(self, tenant_id: UUID) -> AsyncIterator[AuditRecord]:
+    async def records(self, tenant_id: UUID, up_to_seq: int) -> AsyncIterator[AuditRecord]:
         after = 0
         while True:
             query = (
                 select(audit_events)
-                .where(audit_events.c.tenant_id == tenant_id, audit_events.c.seq > after)
+                .where(
+                    audit_events.c.tenant_id == tenant_id,
+                    audit_events.c.seq > after,
+                    audit_events.c.seq <= up_to_seq,
+                )
                 .order_by(audit_events.c.seq)
                 .limit(self._batch_size)
             )

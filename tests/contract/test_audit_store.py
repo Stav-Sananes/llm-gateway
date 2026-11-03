@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from llm_gateway.audit.chain import EMPTY_CHAIN, AuditEvent, ChainHead
-from llm_gateway.audit.log import AuditLog
+from llm_gateway.audit.log import AuditLog, Verification
 from llm_gateway.audit.ports import AuditStore
 from llm_gateway.config import Settings
 from llm_gateway.main import build_engine
@@ -72,7 +72,7 @@ async def test_records_come_back_in_order_across_pages(subject: Subject) -> None
     for n in range(7):  # more than two pages of 3 on Postgres
         await subject.store.append(an_event(tenant, n))
 
-    seqs = [record.seq async for record in subject.store.records(tenant)]
+    seqs = [record.seq async for record in subject.store.records(tenant, up_to_seq=7)]
 
     assert seqs == [1, 2, 3, 4, 5, 6, 7]
 
@@ -81,7 +81,7 @@ async def test_stored_payload_is_the_exact_text_that_was_hashed(subject: Subject
     tenant = await subject.new_tenant()
     appended = await subject.store.append(an_event(tenant, 1))
 
-    [stored] = [record async for record in subject.store.records(tenant)]
+    [stored] = [record async for record in subject.store.records(tenant, up_to_seq=1)]
 
     assert stored == appended
 
@@ -99,6 +99,43 @@ async def test_concurrent_appends_for_one_tenant_form_one_unbroken_chain(
 
 async def test_tenants_have_separate_chains(subject: Subject) -> None:
     acme, globex = await subject.new_tenant(), await subject.new_tenant()
-    await subject.store.append(an_event(acme))
+    for n in range(3):
+        await subject.store.append(an_event(acme, n))
+    globex_record = await subject.store.append(an_event(globex))
 
-    assert (await subject.store.append(an_event(globex))).seq == 1
+    assert globex_record.seq == 1
+    assert [r.seq async for r in subject.store.records(globex, up_to_seq=10)] == [1]
+    assert await subject.store.head(globex) == ChainHead(1, globex_record.hash)
+    assert (await subject.store.head(acme)).seq == 3
+    assert (await AuditLog(subject.store).verify(acme)).ok
+    assert (await AuditLog(subject.store).verify(globex)).ok
+
+
+async def test_records_stop_at_the_requested_seq(subject: Subject) -> None:
+    tenant = await subject.new_tenant()
+    for n in range(5):
+        await subject.store.append(an_event(tenant, n))
+
+    seqs = [record.seq async for record in subject.store.records(tenant, up_to_seq=3)]
+
+    assert seqs == [1, 2, 3]
+
+
+async def test_verify_is_clean_while_the_tenant_keeps_writing(subject: Subject) -> None:
+    tenant = await subject.new_tenant()
+    log = AuditLog(subject.store)
+    await log.record(tenant, "tool.called", {})
+
+    async def keep_writing() -> None:
+        for n in range(40):
+            await log.record(tenant, "tool.called", {"n": n})
+
+    writer = asyncio.create_task(keep_writing())
+    results: list[Verification] = []
+    while not writer.done() and len(results) < 200:
+        results.append(await log.verify(tenant))
+        await asyncio.sleep(0)  # the in-memory store never suspends on its own
+    await writer
+
+    assert results
+    assert all(result.ok for result in results), [r.problem for r in results if not r.ok]

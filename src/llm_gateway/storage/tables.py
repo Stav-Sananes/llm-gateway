@@ -2,6 +2,7 @@
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -62,6 +63,8 @@ audit_events = Table(
     Column("payload", Text, nullable=False),
     Column("recorded_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     PrimaryKeyConstraint("tenant_id", "seq"),
+    # verify starts at seq 1; rows below it could never be checked, so they can't exist.
+    CheckConstraint("seq > 0", name="ck_audit_events_seq_positive"),
 )
 
 TENANT_NAME_UNIQUE = "uq_tenants_name"
