@@ -8,19 +8,22 @@ from typing import Any
 
 import httpx
 
-from harness.fake_llm import FakeLlmScript, create_fake_llm
+from harness.fake_llm import FakeLlmLog, FakeLlmScript, create_fake_llm
 from llm_gateway.config import Settings
 from llm_gateway.main import build_app, build_redis
 from tests.support.backing_services import new_api_key
 from tests.support.servers import serving, unused_local_url
 
 HELLO: dict[str, Any] = {"model": "fake-model", "messages": [{"role": "user", "content": "hi"}]}
-FAKE_TOTAL_TOKENS = 12  # the fake LLM reports 7 prompt + 5 completion tokens
+# FakeLlmScript() reports prompt_tokens=7 plus one completion token per reply part (5).
+FAKE_TOTAL_TOKENS = 12
 
 
 @contextmanager
-def gateway(settings: Settings, api_key: str) -> Iterator[httpx.Client]:
-    with serving(create_fake_llm(FakeLlmScript())) as upstream_url:
+def gateway(
+    settings: Settings, api_key: str, log: FakeLlmLog | None = None
+) -> Iterator[httpx.Client]:
+    with serving(create_fake_llm(FakeLlmScript(), log)) as upstream_url:
         settings = settings.model_copy(update={"upstream_base_url": f"{upstream_url}/v1"})
         headers = {"Authorization": f"Bearer {api_key}"}
         with (
@@ -30,11 +33,11 @@ def gateway(settings: Settings, api_key: str) -> Iterator[httpx.Client]:
             yield client
 
 
-def tokens_used_today(settings: Settings) -> int:
+def tokens_used_on(settings: Settings, day: str) -> int:
     async def read() -> int:
         redis = build_redis(settings)
         try:
-            [key] = await redis.keys(f"gw:budget:*:{datetime.now(UTC).date().isoformat()}")
+            [key] = await redis.keys(f"gw:budget:*:{day}")
             used = await redis.get(key)
             assert used is not None
             return int(used)
@@ -67,10 +70,20 @@ def test_each_tenant_has_its_own_rate_limit(services: Settings) -> None:
 
 
 def test_a_finished_request_is_charged_its_actual_usage(services: Settings) -> None:
+    today = datetime.now(UTC).date().isoformat()  # before the request, in case it spans midnight
     with gateway(services, new_api_key(services)) as client:
         client.post("/v1/chat/completions", json=HELLO | {"max_tokens": 500, "stream": True})
 
-    assert tokens_used_today(services) == FAKE_TOTAL_TOKENS
+    assert tokens_used_on(services, today) == FAKE_TOTAL_TOKENS
+
+
+def test_a_request_without_max_tokens_is_capped_upstream(services: Settings) -> None:
+    log = FakeLlmLog()
+    with gateway(services, new_api_key(services), log) as client:
+        client.post("/v1/chat/completions", json=HELLO)
+
+    [upstream_request] = log.requests
+    assert upstream_request["max_tokens"] == services.default_max_tokens
 
 
 def test_a_request_the_budget_cannot_cover_gets_a_429(services: Settings) -> None:

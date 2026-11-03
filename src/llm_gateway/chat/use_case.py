@@ -6,6 +6,7 @@ provider's reported usage when the stream ends, however it ends.
 """
 
 import logging
+from dataclasses import replace
 
 from llm_gateway.chat.model import ChatRequest, Usage
 from llm_gateway.chat.ports import ChatProvider, ChunkStream
@@ -37,27 +38,36 @@ class ChatCompletions:
     async def start(self, request: ChatRequest, tenant: Tenant) -> ChunkStream:
         """Raises RateLimitedError, BudgetExhaustedError or BudgetUnavailableError up front."""
         await self._rate_limiter.acquire(tenant.id)
-        reservation = await self._budget.reserve(tenant.id, self._worst_case_tokens(request))
-        return self._metered(self._provider.stream(request), reservation)
-
-    def _worst_case_tokens(self, request: ChatRequest) -> int:
-        completion = request.max_tokens or self._default_max_tokens
-        return estimate_prompt_tokens(request.messages) + completion
+        # Cap the completion upstream too, so the reservation really is the worst case.
+        max_tokens = request.max_tokens or self._default_max_tokens
+        worst_case = estimate_prompt_tokens(request.messages) + max_tokens
+        reservation = await self._budget.reserve(tenant.id, worst_case)
+        return self._metered(
+            self._provider.stream(replace(request, max_tokens=max_tokens)), reservation
+        )
 
     async def _metered(self, chunks: ChunkStream, reservation: Reservation) -> ChunkStream:
+        started = False
         usage: Usage | None = None
         try:
             async for chunk in chunks:
+                started = True
                 usage = chunk.usage or usage
                 yield chunk
         finally:
             await chunks.aclose()
-            await self._settle(reservation, usage)
+            await self._settle(reservation, _tokens_used(reservation, started, usage))
 
-    async def _settle(self, reservation: Reservation, usage: Usage | None) -> None:
-        # No usage reported (the stream broke): keep charging the whole reservation.
-        used = reservation.tokens if usage is None else usage.total_tokens
+    async def _settle(self, reservation: Reservation, used: int) -> None:
         try:
             await self._budget.settle(reservation, used)
         except BudgetUnavailableError:
             logger.warning("token budget unavailable at settle; reservation stays charged")
+
+
+def _tokens_used(reservation: Reservation, started: bool, usage: Usage | None) -> int:
+    if usage is not None:
+        return usage.total_tokens
+    # Nothing came back (provider refused or was down): nothing to charge.
+    # Output came back but no usage report (the stream broke): charge the upper bound.
+    return reservation.tokens if started else 0

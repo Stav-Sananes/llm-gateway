@@ -63,3 +63,32 @@ async def test_budget_counters_expire(redis: Redis) -> None:
     reservation = await RedisTokenBudget(redis, 100).reserve(tenant, 10)
 
     assert await redis.ttl(f"gw:budget:{tenant}:{reservation.period}") > 0
+
+
+async def test_settle_after_redis_lost_the_counter_creates_nothing(redis: Redis) -> None:
+    budget, tenant = RedisTokenBudget(redis, 100), uuid4()
+    reservation = await budget.reserve(tenant, 80)
+    await redis.flushdb()  # a restart without persistence, or a failover
+
+    await budget.settle(reservation, 12)
+
+    assert await redis.exists(f"gw:budget:{tenant}:{reservation.period}") == 0
+
+
+async def test_settle_refreshes_the_counter_expiry(redis: Redis) -> None:
+    budget, tenant = RedisTokenBudget(redis, 100), uuid4()
+    reservation = await budget.reserve(tenant, 80)
+    key = f"gw:budget:{tenant}:{reservation.period}"
+    await redis.expire(key, 5)
+
+    await budget.settle(reservation, 12)
+
+    assert await redis.ttl(key) > 5
+
+
+async def test_rate_limit_buckets_expire_once_they_would_be_full_again(redis: Redis) -> None:
+    tenant = uuid4()
+
+    await RedisRateLimiter(redis, capacity=10, refill_per_s=2.0).acquire(tenant)
+
+    assert 0 < await redis.ttl(f"gw:rate:{tenant}") <= 6  # 10 / 2 s + 1

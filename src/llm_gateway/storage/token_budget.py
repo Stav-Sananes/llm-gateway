@@ -20,6 +20,17 @@ redis.call('EXPIRE', KEYS[1], ARGV[3])
 return 1
 """
 
+# Only adjust a counter that still exists: if Redis lost it, a refund must not create a
+# negative counter with no expiry (free budget, forever).
+_SETTLE = """
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+redis.call('INCRBY', KEYS[1], ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return 1
+"""
+
 _KEEP_S = 2 * 24 * 3600  # a period's counter outlives the period, for late settles
 
 Now = Callable[[], datetime]
@@ -31,6 +42,7 @@ class RedisTokenBudget:
     ) -> None:
         self._redis = redis
         self._reserve = redis.register_script(_RESERVE)
+        self._settle = redis.register_script(_SETTLE)
         self._tokens_per_day = tokens_per_day
         self._now = now
 
@@ -49,8 +61,9 @@ class RedisTokenBudget:
     async def settle(self, reservation: Reservation, used_tokens: int) -> None:
         # Settle against the period the tokens were reserved in, even after midnight.
         try:
-            await self._redis.incrby(
-                _key(reservation.tenant_id, reservation.period), used_tokens - reservation.tokens
+            await self._settle(
+                keys=[_key(reservation.tenant_id, reservation.period)],
+                args=[used_tokens - reservation.tokens, _KEEP_S],
             )
         except RedisError as error:
             raise BudgetUnavailableError(str(error)) from error

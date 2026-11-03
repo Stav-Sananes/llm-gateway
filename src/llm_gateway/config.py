@@ -1,5 +1,6 @@
 """Runtime settings, read from GATEWAY_* environment variables."""
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,11 +30,11 @@ class Settings(BaseSettings):
     key_cache_ttl_s: int = 60
 
     # Per tenant. The bucket holds `rate_limit_burst` requests and refills at the given rate.
-    rate_limit_burst: int = 20
-    rate_limit_per_s: float = 5.0
+    rate_limit_burst: int = Field(default=20, gt=0)
+    rate_limit_per_s: float = Field(default=5.0, gt=0)
     # Tokens (prompt + completion) per tenant per UTC day; None turns budgets off.
-    token_budget_per_day: int | None = 1_000_000
-    # Reserved for the completion when a request sets no max_tokens.
-    default_max_tokens: int = 1024
+    token_budget_per_day: int | None = Field(default=1_000_000, gt=0)
+    # Sent upstream as max_tokens when a request sets none, and reserved for the completion.
+    default_max_tokens: int = Field(default=4096, gt=0)
 
     tracing_enabled: bool = False

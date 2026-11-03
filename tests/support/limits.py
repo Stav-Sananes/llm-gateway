@@ -20,6 +20,7 @@ class InMemoryTokenBudget:
     def __init__(self, tokens_per_period: int) -> None:
         self._limit = tokens_per_period
         self._used: dict[UUID, int] = {}
+        self.settled: list[int] = []  # used_tokens of each settle, in order
 
     async def reserve(self, tenant_id: UUID, tokens: int) -> Reservation:
         used = self._used.get(tenant_id, 0)
@@ -29,7 +30,9 @@ class InMemoryTokenBudget:
         return Reservation(tenant_id=tenant_id, period="today", tokens=tokens)
 
     async def settle(self, reservation: Reservation, used_tokens: int) -> None:
-        self._used[reservation.tenant_id] += used_tokens - reservation.tokens
+        self.settled.append(used_tokens)
+        if reservation.tenant_id in self._used:
+            self._used[reservation.tenant_id] += used_tokens - reservation.tokens
 
     def used(self, tenant_id: UUID) -> int:
         return self._used.get(tenant_id, 0)
@@ -54,10 +57,14 @@ class ScriptedProvider:
         self._chunks = chunks
         self._fail_after = fail_after
         self.requests: list[ChatRequest] = []
+        self.closed = False  # the upstream connection was released
 
     async def stream(self, request: ChatRequest) -> ChunkStream:
         self.requests.append(request)
-        for chunk in self._chunks:
-            yield chunk
-        if self._fail_after:
-            raise ProviderUnavailableError("upstream dropped the stream")
+        try:
+            for chunk in self._chunks:
+                yield chunk
+            if self._fail_after:
+                raise ProviderUnavailableError("upstream dropped the stream")
+        finally:
+            self.closed = True

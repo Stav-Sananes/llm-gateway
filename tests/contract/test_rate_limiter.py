@@ -50,6 +50,20 @@ async def test_refills_over_time(limiter_with: LimiterFactory) -> None:
     await limiter.acquire(tenant)
 
 
+async def test_an_idle_bucket_never_holds_more_than_its_burst(
+    limiter_with: LimiterFactory,
+) -> None:
+    limiter, tenant = limiter_with(2, 50.0), uuid4()
+    await limiter.acquire(tenant)
+
+    await asyncio.sleep(0.2)  # ten tokens' worth of refill
+
+    await limiter.acquire(tenant)
+    await limiter.acquire(tenant)
+    with pytest.raises(RateLimitedError):
+        await limiter.acquire(tenant)
+
+
 async def test_tenants_do_not_share_a_bucket(limiter_with: LimiterFactory) -> None:
     limiter = limiter_with(1, 0.1)
     await limiter.acquire(uuid4())
