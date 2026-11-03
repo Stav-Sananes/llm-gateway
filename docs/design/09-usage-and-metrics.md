@@ -15,7 +15,8 @@ ChatCompletions._metered (chat/use_case.py), when the stream ends however it end
                           │   Redis down → event dropped, logged, gateway_usage_events_dropped_total
                           ▼
 llm-gateway usage-worker (separate process) ─ UsageWorker (usage/worker.py)
-   take: own unacked entries, then other consumers' stale ones (XAUTOCLAIM), then new (XREADGROUP BLOCK)
+   take: own unacked entries, then other consumers' stale ones (XAUTOCLAIM, which since Redis 7
+         also drops entries MAXLEN trimmed), then new (XREADGROUP BLOCK)
    trimmed before stored (empty) → ack, counted lost;  undecodable → gw:usage:dead + ack
    insert_many (ON CONFLICT (event_id) DO NOTHING) ─► ack + delete
    insert fails and Postgres doesn't answer → no ack, back off 1 s … 30 s; delivered again

@@ -138,13 +138,11 @@ class RedisUsageQueue:
         )
 
     async def _stale(self, count: int) -> list[tuple[Any, Any]]:
+        # Since Redis 7, XAUTOCLAIM also drops entries MAXLEN trimmed from the pending list.
         reply = await self._redis.xautoclaim(
             STREAM, GROUP, self._consumer, self._reclaim_idle_ms, start_id="0-0", count=count
         )
-        claimed, trimmed = reply[1], reply[2] if len(reply) > 2 else []
-        if trimmed:  # pending entries MAXLEN already removed: nothing left to deliver
-            await self._redis.xack(STREAM, GROUP, *trimmed)
-        return list(claimed)
+        return list(reply[1])
 
     async def _new(self, count: int) -> list[tuple[Any, Any]]:
         return _stream_entries(

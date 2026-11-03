@@ -10,7 +10,7 @@ error alone isn't safe: some refused values surface as generic driver errors.)
 """
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -57,11 +57,13 @@ class UsageWorker:
         store: UsageStore,
         batch_size: int = 500,
         observer: WorkerObserver | None = None,
+        sleep: Callable[[float], Awaitable[None]] = anyio.sleep,
     ) -> None:
         self._queue = queue
         self._store = store
         self._batch_size = batch_size
         self._observer = observer or _Unobserved()
+        self._sleep = sleep
 
     async def drain_once(self) -> Drained:
         """One batch. Raises UsageQueueUnavailableError or UsageStoreUnavailableError."""
@@ -94,14 +96,14 @@ class UsageWorker:
             except (UsageQueueUnavailableError, UsageStoreUnavailableError) as error:
                 self._observer.failed(error)
                 logger.warning("usage worker waiting %.1fs: %s", delay, error)
-                await anyio.sleep(delay)
+                await self._sleep(delay)
                 delay = min(delay * 2, max_retry_s)
                 continue
             delay = retry_s
             if result == Drained():
                 # The queue normally blocks while empty; this keeps a queue that doesn't
                 # from turning the loop into a spin.
-                await anyio.sleep(idle_s)
+                await self._sleep(idle_s)
 
     async def _store_all(self, deliveries: Sequence[Delivery]) -> list[Delivery]:
         """Stores what it can; returns the deliveries that can't be stored. Raises

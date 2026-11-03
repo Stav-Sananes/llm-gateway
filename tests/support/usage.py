@@ -6,6 +6,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID
 
+import anyio
+
 from llm_gateway.usage.model import Outcome, UsageEvent
 from llm_gateway.usage.ports import (
     Delivery,
@@ -16,10 +18,14 @@ from llm_gateway.usage.ports import (
 
 
 class RecordedUsage:
+    """Records events. Yields to the event loop first, as the real recorder's Redis round
+    trip does, so a test can tell recording inside a cancellation shield from outside it."""
+
     def __init__(self) -> None:
         self.events: list[UsageEvent] = []
 
     async def record(self, event: UsageEvent) -> None:
+        await anyio.lowlevel.checkpoint()
         self.events.append(event)
 
 
@@ -63,6 +69,7 @@ class InMemoryUsageQueue:
         self.down = down
 
     async def take(self, max_events: int) -> Sequence[Delivery]:
+        await anyio.lowlevel.checkpoint()  # the real queue always waits on Redis
         if self.down:
             raise UsageQueueUnavailableError("redis down")
         return [d for d in self.pending if d.delivery_id not in self.acked][:max_events]
@@ -86,7 +93,7 @@ class InMemoryUsageStore:
     async def insert_many(self, events: Sequence[UsageEvent]) -> None:
         if self.down:
             raise UsageStoreUnavailableError("postgres down")
-        if any(e.prompt_tokens < 0 or e.charged_tokens < 0 for e in events):
+        if any(min(e.prompt_tokens, e.completion_tokens, e.charged_tokens) < 0 for e in events):
             raise InvalidUsageEventError("ck_usage_events_tokens_not_negative")
         if any("\x00" in e.requested_model for e in events):
             raise UsageStoreUnavailableError("DBAPIError")

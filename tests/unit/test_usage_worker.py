@@ -121,3 +121,23 @@ async def test_an_entry_trimmed_before_it_was_stored_is_counted_lost_not_dead_le
     assert result == Drained(written=1, lost=1)
     assert queue.dead == []
     assert sorted(queue.acked) == ["1-0", "2-0"]
+
+
+async def test_run_backs_off_doubling_up_to_the_cap_and_resets_after_a_drain() -> None:
+    queue, store = InMemoryUsageQueue(delivered(1), down=True), InMemoryUsageStore()
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 6:
+            queue.down = False  # Redis comes back
+        if len(sleeps) == 8:
+            raise anyio.get_cancelled_exc_class()
+        await anyio.lowlevel.checkpoint()
+
+    with pytest.raises(anyio.get_cancelled_exc_class()):
+        await UsageWorker(queue, store, sleep=sleep).run(retry_s=1, max_retry_s=8, idle_s=0.5)
+
+    # Six failures back off 1, 2, 4, 8, 8, 8; then a drain, then idle sleeps only.
+    assert sleeps == [1, 2, 4, 8, 8, 8, 0.5, 0.5]
+    assert len(store.events) == 1

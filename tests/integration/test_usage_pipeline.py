@@ -96,13 +96,13 @@ async def test_an_unacknowledged_event_is_delivered_again(redis: Redis) -> None:
 
 
 async def test_a_crashed_workers_events_are_claimed_by_another_once_stale(redis: Redis) -> None:
-    crashed, survivor = a_queue(redis, "w1"), a_queue(redis, "w2", reclaim_idle_ms=50)
+    crashed, survivor = a_queue(redis, "w1"), a_queue(redis, "w2", reclaim_idle_ms=500)
     await crashed.ensure_group()
     await RedisUsageStream(redis).record(a_usage_event())
     [taken] = await crashed.take(10)
 
     assert await survivor.take(10) == []  # not stale yet
-    await anyio.sleep(0.1)
+    await anyio.sleep(0.6)
     [claimed] = await survivor.take(10)
 
     assert claimed.delivery_id == taken.delivery_id
@@ -137,12 +137,13 @@ async def test_the_queue_recovers_when_redis_lost_the_stream(redis: Redis) -> No
 
 
 async def test_the_stream_is_capped(redis: Redis) -> None:
-    stream = RedisUsageStream(redis, max_len=10)
+    stream = RedisUsageStream(redis, max_len=200)
 
-    for _ in range(500):
+    for _ in range(2000):
         await stream.record(a_usage_event())
 
-    assert await redis.xlen(STREAM) < 500
+    # "~" trims whole radix-tree nodes (100 entries each), so it may keep up to a node more.
+    assert 200 <= await redis.xlen(STREAM) <= 200 + 100
 
 
 async def test_with_redis_down_an_event_is_dropped_and_counted_quickly() -> None:
@@ -261,3 +262,45 @@ async def test_the_backlog_shows_what_waits_and_what_is_unacknowledged(redis: Re
     await queue.take(1)
 
     assert await queue.backlog() == (3, 1, 2)
+
+
+async def test_pending_entries_the_cap_trimmed_are_acknowledged_not_reclaimed_forever(
+    redis: Redis,
+) -> None:
+    crashed, survivor = a_queue(redis, "w1"), a_queue(redis, "w2", reclaim_idle_ms=0)
+    await crashed.ensure_group()
+    await RedisUsageStream(redis).record(a_usage_event())
+    await crashed.take(10)  # delivered, never acknowledged
+    await redis.xtrim(STREAM, maxlen=0)  # the cap removes it while it's pending
+
+    await survivor.take(10)
+
+    assert (await redis.xpending(STREAM, "usage-writers"))["pending"] == 0
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        encode(a_usage_event()).replace("+00:00", ""),  # no time zone
+        encode(a_usage_event()).replace('"prompt_tokens": 7', '"prompt_tokens": -1'),
+        encode(a_usage_event()).replace('"prompt_tokens": 7', '"prompt_tokens": true'),
+        encode(a_usage_event()).replace('"prompt_tokens": 7', '"prompt_tokens": "7"'),
+        encode(a_usage_event()).replace('"completed"', '"mystery"'),
+        encode(a_usage_event()).replace('"duration_s"', '"elapsed"'),
+        "not json",
+        "[]",
+    ],
+    ids=[
+        "naive-time",
+        "negative",
+        "bool",
+        "string-count",
+        "outcome",
+        "missing-key",
+        "garbage",
+        "list",
+    ],
+)
+def test_decode_refuses_anything_but_a_well_formed_event(raw: str) -> None:
+    with pytest.raises((ValueError, KeyError, TypeError)):
+        decode(raw)

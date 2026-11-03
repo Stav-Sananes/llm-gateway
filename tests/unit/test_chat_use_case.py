@@ -38,6 +38,7 @@ def chat(
     budget: InMemoryTokenBudget | None = None,
     rate_limiter: InMemoryRateLimiter | None = None,
     usage: RecordedUsage | None = None,
+    finish_timeout_s: float = 5.0,
 ) -> ChatCompletions:
     return ChatCompletions(
         provider or ScriptedProvider(REPLY),
@@ -46,6 +47,7 @@ def chat(
         DEFAULT_MAX_TOKENS,
         usage or RecordedUsage(),
         clock=FakeClock(step_s=1.0),
+        finish_timeout_s=finish_timeout_s,
     )
 
 
@@ -230,3 +232,30 @@ async def test_a_cancelled_request_still_settles_and_records_its_usage() -> None
     assert budget.settled == [PROMPT_ESTIMATE + DEFAULT_MAX_TOKENS]
     assert [e.outcome for e in usage.events] == [Outcome.INTERRUPTED]
     assert provider.closed
+
+
+class HangingSettleBudget(InMemoryTokenBudget):
+    async def settle(self, reservation: Reservation, used_tokens: int) -> None:
+        await anyio.sleep_forever()
+
+
+async def test_a_settle_that_hangs_cannot_hold_the_stream_open(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    chunks = await chat(budget=HangingSettleBudget(10_000), finish_timeout_s=0.05).start(
+        a_request(), ACME
+    )
+
+    with anyio.fail_after(2):
+        await collect(chunks)
+
+    assert "settle or usage lost" in caplog.text
+
+
+async def test_a_chunk_after_the_usage_report_does_not_erase_it() -> None:
+    usage = RecordedUsage()
+    provider = ScriptedProvider((*REPLY, CompletionChunk(content="")))
+
+    await collect(await chat(provider, usage=usage).start(a_request(), ACME))
+
+    assert usage.events[0].charged_tokens == USAGE.total_tokens

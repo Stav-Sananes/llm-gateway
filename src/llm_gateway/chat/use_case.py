@@ -45,6 +45,7 @@ class ChatCompletions:
         default_max_tokens: int,
         usage: UsageRecorder = NO_USAGE_RECORDING,
         clock: Callable[[], float] = time.monotonic,
+        finish_timeout_s: float = FINISH_TIMEOUT_S,
     ) -> None:
         self._provider = provider
         self._rate_limiter = rate_limiter
@@ -52,6 +53,7 @@ class ChatCompletions:
         self._default_max_tokens = default_max_tokens
         self._usage = usage
         self._clock = clock
+        self._finish_timeout_s = finish_timeout_s
 
     async def start(self, request: ChatRequest, tenant: Tenant) -> ChunkStream:
         """Raises RateLimitedError, BudgetExhaustedError or BudgetUnavailableError up front."""
@@ -76,13 +78,15 @@ class ChatCompletions:
             # Shielded: when the client disconnects, the request is cancelled and this runs
             # inside the cancellation; unshielded, the settle would never happen and the
             # tenant would stay charged the worst case.
-            with anyio.move_on_after(FINISH_TIMEOUT_S, shield=True) as finishing:
+            with anyio.move_on_after(self._finish_timeout_s, shield=True) as finishing:
                 await chunks.aclose()
                 charged = _tokens_used(reservation, meter.started, meter.usage)
                 await self._settle(reservation, charged)
                 await self._usage.record(meter.event(reservation, charged))
             if finishing.cancelled_caught:
-                logger.error("request finish took over %ss; settle or usage lost", FINISH_TIMEOUT_S)
+                logger.error(
+                    "request finish took over %ss; settle or usage lost", self._finish_timeout_s
+                )
 
     async def _settle(self, reservation: Reservation, used: int) -> None:
         try:
