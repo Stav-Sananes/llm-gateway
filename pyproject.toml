@@ -37,6 +37,7 @@ build-backend = "uv_build"
 dev = [
     "mypy>=2.4.0",
     "pytest>=9.1.1",
+    "pytest-timeout>=2.4.0",
     "ruff>=0.17.3",
     "testcontainers[postgres,redis]>=4.15.0",
 ]
@@ -61,3 +62,5 @@ explicit_package_bases = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# A broken deadline must fail a test, not hang the run.
+timeout = 120

@@ -30,8 +30,10 @@ def create_app(
     app.include_router(chat_router(chat, bearer_tenant(authenticator)))
     if mcp_app is not None:
         # A route, not a mount: clients use the exact URL /mcp, with no trailing slash.
-        # Starlette serves a non-function endpoint as a raw ASGI app.
-        app.router.routes.append(Route("/mcp", endpoint=mcp_app, methods=["GET", "POST", "DELETE"]))
+        # Starlette serves a non-function endpoint as a raw ASGI app. POST only: in stateless
+        # JSON mode GET (a server-to-client SSE stream that never closes) and DELETE (end a
+        # session) have nothing to serve, and an open GET stream would hold a task forever.
+        app.router.routes.append(Route("/mcp", endpoint=mcp_app, methods=["POST"]))
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

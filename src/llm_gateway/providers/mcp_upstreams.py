@@ -22,6 +22,7 @@ from llm_gateway.tools.model import (
     ToolSpec,
     UnknownToolError,
     UpstreamUnavailableError,
+    is_valid_server_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,9 +30,10 @@ logger = logging.getLogger(__name__)
 
 class HttpMcpUpstreams:
     def __init__(self, servers: Mapping[str, str], timeout_s: float) -> None:
-        if bad := [name for name in servers if SEPARATOR in name or not name]:
+        if bad := [name for name in servers if not is_valid_server_name(name)]:
             raise ValueError(
-                f"MCP server names must be non-empty and not contain {SEPARATOR!r}: {bad}"
+                f"MCP server names must be non-empty, not contain {SEPARATOR!r} "
+                f"and not end in '_': {bad}"
             )
         self._servers = dict(servers)
         self._timeout_s = timeout_s

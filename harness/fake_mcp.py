@@ -7,8 +7,10 @@ HTTP to them, and the logs show which calls actually reached an upstream.
 from dataclasses import dataclass, field
 from typing import Any
 
+import anyio
 from mcp.server.mcpserver import MCPServer
 from starlette.applications import Starlette
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 
 @dataclass
@@ -50,3 +52,18 @@ def create_fake_fs_server(log: McpCallLog) -> Starlette:
         raise ValueError(f"no such file: {path}")  # an MCP-level error result
 
     return server.streamable_http_app(stateless_http=True, json_response=True)
+
+
+def slowed(app: ASGIApp, per_request_s: float) -> ASGIApp:
+    """`app`, answering every HTTP request only after `per_request_s`.
+
+    Each request stays under a per-read timeout, but one MCP operation is several requests
+    (initialize, initialized, the call), so only an overall deadline stops it in time.
+    """
+
+    async def slow_app(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            await anyio.sleep(per_request_s)
+        await app(scope, receive, send)
+
+    return slow_app

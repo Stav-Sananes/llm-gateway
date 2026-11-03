@@ -1,6 +1,8 @@
 """/mcp end to end: an MCP client, the gateway (auth, Cedar, audit chain) and fake upstreams."""
 
 import asyncio
+import json
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -11,7 +13,7 @@ from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 
-from harness.fake_mcp import McpCallLog, create_fake_fs_server, create_fake_sql_server
+from harness.fake_mcp import McpCallLog, create_fake_fs_server, create_fake_sql_server, slowed
 from llm_gateway.audit.log import AuditLog, Verification
 from llm_gateway.config import Settings
 from llm_gateway.main import build_app, build_engine
@@ -19,6 +21,10 @@ from llm_gateway.storage.audit_store import PostgresAuditStore
 from llm_gateway.storage.tenant_store import PostgresTenantStore
 from tests.support.backing_services import new_api_key
 from tests.support.servers import serving
+
+CLIENT_TIMEOUT_S = 15  # a broken gateway deadline fails the test instead of hanging it
+MCP_HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+LIST_TOOLS = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
 
 
 @dataclass
@@ -53,7 +59,7 @@ def mcp(
         async with (
             create_mcp_http_client(headers=headers) as http_client,
             streamable_http_client(gateway.url, http_client=http_client) as (read, write),
-            ClientSession(read, write) as session,
+            ClientSession(read, write, read_timeout_seconds=CLIENT_TIMEOUT_S) as session,
         ):
             await session.initialize()
             tools = sorted(tool.name for tool in (await session.list_tools()).tools)
@@ -73,14 +79,15 @@ def text(result: types.CallToolResult) -> str:
     return block.text
 
 
-def audit_trail(services: Settings) -> tuple[list[str], Verification]:
-    async def read() -> tuple[list[str], Verification]:
+def audit_trail(services: Settings) -> tuple[list[dict[str, Any]], Verification]:
+    async def read() -> tuple[list[dict[str, Any]], Verification]:
         engine = build_engine(services)
         try:
             tenant = await PostgresTenantStore(engine).tenant_named("acme")
             assert tenant is not None
             store = PostgresAuditStore(engine)
-            actions = [record.payload async for record in store.records(tenant.id, up_to_seq=1000)]
+            records = store.records(tenant.id, up_to_seq=1000)
+            actions = [json.loads(record.payload) async for record in records]
             return actions, await AuditLog(store).verify(tenant.id)
         finally:
             await engine.dispose()
@@ -99,6 +106,7 @@ def test_an_allowed_call_reaches_the_upstream(gateway: Gateway) -> None:
 
     assert not result.is_error
     assert "42" in text(result)
+    assert result.structured_content == {"result": "id | total\n1  | 42"}
     assert gateway.sql.calls == [("query", {"sql": "SELECT * FROM analytics.orders"})]
 
 
@@ -143,19 +151,58 @@ def test_every_call_is_on_the_tenants_verified_audit_chain(
 
     assert verification.ok
     assert verification.checked == 3  # decided + completed, then decided (denied)
-    assert '"decision":"allow"' in payloads[0]
-    assert '"action":"tool.call.completed"' in payloads[1]
-    assert '"decision":"deny"' in payloads[2]
+    assert [p["action"] for p in payloads] == [
+        "tool.call.decided",
+        "tool.call.completed",
+        "tool.call.decided",
+    ]
+    assert payloads[0]["details"]["decision"] == "allow"
+    assert payloads[2]["details"]["decision"] == "deny"
 
 
 @pytest.mark.parametrize("authorization", [None, "Bearer gw_deadbeef_" + "x" * 43])
 def test_mcp_without_a_valid_key_is_a_401(gateway: Gateway, authorization: str | None) -> None:
-    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    headers = dict(MCP_HEADERS)
     if authorization:
         headers["Authorization"] = authorization
-    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
 
-    response = httpx.post(gateway.url, json=body, headers=headers)
+    response = httpx.post(gateway.url, json=LIST_TOOLS, headers=headers)
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "invalid_api_key"
+
+
+def test_any_replica_can_answer_a_request_with_no_session_in_plain_json(gateway: Gateway) -> None:
+    # Stateless JSON mode: no initialize handshake, no session id, no SSE stream.
+    headers = MCP_HEADERS | {"Authorization": f"Bearer {gateway.api_key}"}
+
+    response = httpx.post(gateway.url, json=LIST_TOOLS, headers=headers)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert "mcp-session-id" not in response.headers
+    assert len(response.json()["result"]["tools"]) == 4
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+def test_mcp_only_takes_posts(gateway: Gateway, method: str) -> None:
+    # A GET would open a server-to-client stream that never closes.
+    headers = MCP_HEADERS | {"Authorization": f"Bearer {gateway.api_key}"}
+
+    response = httpx.request(method, gateway.url, headers=headers, timeout=5)
+
+    assert response.status_code == 405
+
+
+def test_the_configured_upstream_timeout_is_the_one_applied(services: Settings) -> None:
+    with serving(slowed(create_fake_sql_server(McpCallLog()), per_request_s=0.6)) as sql_url:
+        settings = services.model_copy(
+            update={"mcp_servers": {"sql": f"{sql_url}/mcp"}, "mcp_timeout_s": 1.0}
+        )
+        with serving(build_app(settings)) as url:
+            gateway = Gateway(f"{url}/mcp", new_api_key(services), McpCallLog(), McpCallLog())
+            started = time.monotonic()
+            _, [result] = mcp(gateway, ("sql__query", {"sql": "SELECT * FROM analytics.orders"}))
+
+    assert text(result) == "sql__query is unavailable."
+    assert time.monotonic() - started < 5

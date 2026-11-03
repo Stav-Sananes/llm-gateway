@@ -33,6 +33,7 @@ from llm_gateway.storage.tenant_store import PostgresTenantStore
 from llm_gateway.storage.token_budget import RedisTokenBudget
 from llm_gateway.tenancy.auth import Authenticator
 from llm_gateway.tools.gateway import ToolGateway
+from llm_gateway.tools.model import ToolLimits
 
 
 def build_upstream_client(settings: Settings) -> httpx.AsyncClient:
@@ -146,6 +147,7 @@ def build_app(settings: Settings) -> FastAPI:
         HttpMcpUpstreams(settings.mcp_servers, settings.mcp_timeout_s),
         policy,
         AuditLog(PostgresAuditStore(engine)),
+        ToolLimits(settings.mcp_max_argument_bytes, settings.mcp_max_result_bytes),
     )
     mcp_app, mcp_sessions = build_mcp_app(build_mcp_server(tools), authenticator)
 
