@@ -138,6 +138,25 @@ def test_unreachable_upstream_is_a_502(gateway_to: GatewayTo, stream: bool) -> N
 
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "upstream_error"
+    # Which provider failed, and how, stays in the gateway's logs.
+    assert "127.0.0.1" not in response.text
+
+
+def test_upstream_rate_limiting_the_gateway_is_a_502_not_the_clients_429(
+    gateway_with: GatewayWith,
+) -> None:
+    # Our provider quota ran out: the client's request was fine, so it isn't told it's limited.
+    with gateway_with(FakeLlmScript(fail_status=429)) as gateway:
+        response = gateway.post("/v1/chat/completions", json=HELLO)
+
+    assert response.status_code == 502
+
+
+def test_upstream_stream_ending_without_done_is_a_502(gateway_with: GatewayWith) -> None:
+    with gateway_with(FakeLlmScript(omit_done=True)) as gateway:
+        response = gateway.post("/v1/chat/completions", json=HELLO)
+
+    assert response.status_code == 502
 
 
 def test_upstream_server_error_is_a_502(gateway_with: GatewayWith) -> None:

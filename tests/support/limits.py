@@ -1,11 +1,8 @@
 """Fakes for the limits ports, and a scripted chat provider."""
 
-from collections.abc import Sequence
 from typing import NoReturn
 from uuid import UUID
 
-from llm_gateway.chat.model import ChatRequest, CompletionChunk
-from llm_gateway.chat.ports import ChunkStream, ProviderUnavailableError
 from llm_gateway.limits.ports import (
     BudgetExhaustedError,
     BudgetUnavailableError,
@@ -48,23 +45,3 @@ class SettleFailsBudget(InMemoryTokenBudget):
 
     async def settle(self, reservation: Reservation, used_tokens: int) -> NoReturn:
         raise BudgetUnavailableError("budget store went down")
-
-
-class ScriptedProvider:
-    """Streams the given chunks; optionally fails after them, like a dropped upstream."""
-
-    def __init__(self, chunks: Sequence[CompletionChunk], fail_after: bool = False) -> None:
-        self._chunks = chunks
-        self._fail_after = fail_after
-        self.requests: list[ChatRequest] = []
-        self.closed = False  # the upstream connection was released
-
-    async def stream(self, request: ChatRequest) -> ChunkStream:
-        self.requests.append(request)
-        try:
-            for chunk in self._chunks:
-                yield chunk
-            if self._fail_after:
-                raise ProviderUnavailableError("upstream dropped the stream")
-        finally:
-            self.closed = True

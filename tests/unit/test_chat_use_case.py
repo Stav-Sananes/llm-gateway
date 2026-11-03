@@ -9,7 +9,8 @@ from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.limits.ports import BudgetExhaustedError, RateLimitedError
 from llm_gateway.limits.token_bucket import InMemoryRateLimiter
 from llm_gateway.tenancy.model import Tenant
-from tests.support.limits import InMemoryTokenBudget, ScriptedProvider, SettleFailsBudget
+from tests.support.limits import InMemoryTokenBudget, SettleFailsBudget
+from tests.support.providers import ScriptedProvider
 
 pytestmark = pytest.mark.anyio
 

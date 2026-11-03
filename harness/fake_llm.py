@@ -22,6 +22,7 @@ class FakeLlmScript:
     fail_status: int | None = None
     fail_message: str = "scripted failure"
     break_after_chunks: int | None = None
+    omit_done: bool = False  # end the stream cleanly but without the [DONE] line
 
 
 @dataclass
@@ -58,7 +59,8 @@ async def _stream(script: FakeLlmScript, model: str) -> AsyncIterator[str]:
         yield _event(_chunk(model, {"content": token}, finish_reason=None))
     yield _event(_chunk(model, {}, finish_reason="stop"))
     yield _event(_usage_chunk(model, script))
-    yield "data: [DONE]\n\n"
+    if not script.omit_done:
+        yield "data: [DONE]\n\n"
 
 
 def _chunk(model: str, delta: dict[str, str], finish_reason: str | None) -> dict[str, Any]:

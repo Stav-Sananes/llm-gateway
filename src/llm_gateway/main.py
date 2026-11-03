@@ -3,6 +3,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import anthropic
 import httpx
 import uvicorn
 from fastapi import FastAPI
@@ -17,7 +18,10 @@ from llm_gateway.http.app import create_app
 from llm_gateway.limits.policies import FailOpenRateLimiter, UnlimitedBudget
 from llm_gateway.limits.ports import TokenBudget
 from llm_gateway.limits.token_bucket import InMemoryRateLimiter
+from llm_gateway.providers.anthropic import AnthropicProvider
 from llm_gateway.providers.openai_compatible import OpenAICompatibleProvider
+from llm_gateway.routing.breaker import CircuitBreaker, GuardedProvider
+from llm_gateway.routing.router import Router, Target
 from llm_gateway.storage.key_cache import RedisKeyCache
 from llm_gateway.storage.rate_limiter import RedisRateLimiter
 from llm_gateway.storage.tenant_store import PostgresTenantStore
@@ -36,6 +40,52 @@ def build_upstream_client(settings: Settings) -> httpx.AsyncClient:
         ),
         limits=httpx.Limits(max_connections=settings.upstream_max_connections),
     )
+
+
+def build_anthropic_client(settings: Settings) -> anthropic.AsyncAnthropic | None:
+    if settings.anthropic_api_key is None:
+        return None
+    return anthropic.AsyncAnthropic(
+        api_key=settings.anthropic_api_key.get_secret_value(),
+        base_url=settings.anthropic_base_url,
+        timeout=anthropic.Timeout(
+            connect=settings.upstream_connect_timeout_s,
+            read=settings.upstream_read_timeout_s,
+            # Sending a request with images can take longer than connecting.
+            write=settings.upstream_read_timeout_s,
+            pool=settings.upstream_connect_timeout_s,
+        ),
+        # The router falls back to the next provider; SDK retries would only add latency.
+        max_retries=0,
+    )
+
+
+def build_router(
+    settings: Settings,
+    upstream_client: httpx.AsyncClient,
+    anthropic_client: anthropic.AsyncAnthropic | None,
+) -> tuple[Router, list[CircuitBreaker]]:
+    providers: dict[str, ChatProvider] = {
+        settings.upstream_name: OpenAICompatibleProvider(upstream_client, settings.upstream_name)
+    }
+    if anthropic_client is not None:
+        if "anthropic" in providers:
+            raise ValueError("GATEWAY_UPSTREAM_NAME must not be 'anthropic'; that name is taken")
+        providers["anthropic"] = AnthropicProvider(
+            anthropic_client, settings.default_max_tokens, settings.anthropic_refusal_fallbacks
+        )
+    breakers = [
+        CircuitBreaker(name, settings.breaker_failure_threshold, settings.breaker_reset_s)
+        for name in providers
+    ]
+    guarded: dict[str, ChatProvider] = {
+        b.name: GuardedProvider(providers[b.name], b) for b in breakers
+    }
+    routes = {
+        model: [Target(t.provider, t.model) for t in targets]
+        for model, targets in settings.routes.items()
+    }
+    return Router(guarded, routes, default_provider=settings.upstream_name), breakers
 
 
 def build_engine(settings: Settings) -> AsyncEngine:
@@ -76,7 +126,8 @@ def build_chat(settings: Settings, provider: ChatProvider, redis: Redis) -> Chat
 def build_app(settings: Settings) -> FastAPI:
     tracer_provider = telemetry.install_tracer_provider() if settings.tracing_enabled else None
     upstream_client = build_upstream_client(settings)
-    provider = OpenAICompatibleProvider(upstream_client, settings.upstream_name)
+    anthropic_client = build_anthropic_client(settings)
+    router, breakers = build_router(settings, upstream_client, anthropic_client)
     engine = build_engine(settings)
     redis = build_redis(settings)
     authenticator = Authenticator(
@@ -87,12 +138,16 @@ def build_app(settings: Settings) -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         yield
         await upstream_client.aclose()
+        if anthropic_client is not None:
+            await anthropic_client.close()
         await redis.aclose()
         await engine.dispose()
         if tracer_provider is not None:
             tracer_provider.shutdown()
 
-    app = create_app(build_chat(settings, provider, redis), authenticator, lifespan=lifespan)
+    app = create_app(
+        build_chat(settings, router, redis), authenticator, breakers, lifespan=lifespan
+    )
     if tracer_provider is not None:
         telemetry.instrument(app, upstream_client)
     return app

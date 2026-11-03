@@ -5,14 +5,15 @@ from collections.abc import Mapping
 from typing import Any
 
 import httpx
-from opentelemetry import trace
-from opentelemetry.trace import Span, SpanKind, StatusCode
+from opentelemetry.trace import StatusCode
 
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, Usage
 from llm_gateway.chat.ports import ChunkStream, ProviderRejectedError, ProviderUnavailableError
 from llm_gateway.providers.sse import DONE_SENTINEL, sse_data
+from llm_gateway.providers.tracing import record_usage, start_chat_span
 
-_tracer = trace.get_tracer(__name__)
+# Statuses that say "this provider can't serve right now" (try another), not "bad request".
+UNAVAILABLE_STATUSES = frozenset({401, 403, 408, 429})
 
 
 class OpenAICompatibleProvider:
@@ -21,12 +22,10 @@ class OpenAICompatibleProvider:
         self._provider_name = provider_name
 
     async def stream(self, request: ChatRequest) -> ChunkStream:
-        # Span is started detached (not made current): this generator is resumed
-        # from different tasks, and attaching context across yields corrupts it.
-        span = self._start_span(request)
+        span = start_chat_span(self._provider_name, request)
         try:
             async for chunk in self._stream_upstream(request):
-                _record_usage(span, chunk.usage)
+                record_usage(span, chunk.usage)
                 yield chunk
         except ProviderUnavailableError as error:
             span.set_status(StatusCode.ERROR, str(error))
@@ -46,6 +45,7 @@ class OpenAICompatibleProvider:
                         return
                     if data:
                         yield parse_chunk(json.loads(data))
+            raise ProviderUnavailableError(f"{self._provider_name} stream ended without [DONE]")
         except httpx.TimeoutException as error:
             raise ProviderUnavailableError(f"{self._provider_name} timed out") from error
         except httpx.TransportError as error:
@@ -58,20 +58,9 @@ class OpenAICompatibleProvider:
             return
         await response.aread()
         message = _error_message(response)
-        if response.status_code >= 500:
+        if response.status_code >= 500 or response.status_code in UNAVAILABLE_STATUSES:
             raise ProviderUnavailableError(f"{self._provider_name} failed: {message}")
         raise ProviderRejectedError(response.status_code, message)
-
-    def _start_span(self, request: ChatRequest) -> Span:
-        return _tracer.start_span(
-            f"chat {request.model}",
-            kind=SpanKind.CLIENT,
-            attributes={
-                "gen_ai.operation.name": "chat",
-                "gen_ai.provider.name": self._provider_name,
-                "gen_ai.request.model": request.model,
-            },
-        )
 
 
 def to_wire_request(request: ChatRequest) -> dict[str, Any]:
@@ -119,10 +108,3 @@ def _error_message(response: httpx.Response) -> str:
     if isinstance(error, Mapping):
         return str(error.get("message", error))
     return str(error or response.reason_phrase)
-
-
-def _record_usage(span: Span, usage: Usage | None) -> None:
-    if usage is None:
-        return
-    span.set_attribute("gen_ai.usage.input_tokens", usage.prompt_tokens)
-    span.set_attribute("gen_ai.usage.output_tokens", usage.completion_tokens)
