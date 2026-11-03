@@ -3,9 +3,10 @@
     take a batch ─► dead-letter what can't be decoded ─► insert the rest (idempotent) ─► ack
 
 Nothing is acknowledged until it is stored, so a crash or a store outage only delays
-events: they are delivered again. If the store refuses a batch's data, the events are
-inserted one at a time and only the refused ones are dead-lettered, so one bad event
-can't block the queue.
+events: they are delivered again. If a batch fails while the store is up, the problem is
+in the batch: the events are inserted one at a time and only the ones that fail are
+dead-lettered, so one bad event can't block the queue. (Telling the two apart by the
+error alone isn't safe: some refused values surface as generic driver errors.)
 """
 
 import logging
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 class Drained:
     written: int = 0
     dead_lettered: int = 0
+    lost: int = 0  # trimmed from the stream before they were stored
 
 
 class WorkerObserver(Protocol):
@@ -64,19 +66,20 @@ class UsageWorker:
     async def drain_once(self) -> Drained:
         """One batch. Raises UsageQueueUnavailableError or UsageStoreUnavailableError."""
         deliveries = await self._queue.take(self._batch_size)
-        undecodable = [d for d in deliveries if d.event is None]
-        for delivery in undecodable:
-            logger.error("usage event %s undecodable; dead-lettered", delivery.delivery_id)
-            await self._queue.dead_letter(delivery)
+        lost = [d for d in deliveries if d.lost]
+        if lost:
+            logger.error("%d usage events were trimmed before they were stored", len(lost))
+            await self._queue.ack([d.delivery_id for d in lost])
+        undecodable = [d for d in deliveries if d.event is None and not d.lost]
         decoded = [d for d in deliveries if d.event is not None]
         refused = await self._store_all(decoded)
-        for delivery in refused:
-            logger.error("usage event %s refused by the store; dead-lettered", delivery.delivery_id)
+        for delivery in undecodable + refused:
+            logger.error("usage event %s dead-lettered", delivery.delivery_id)
             await self._queue.dead_letter(delivery)
         stored = [d.delivery_id for d in decoded if d not in refused]
         if stored:
             await self._queue.ack(stored)
-        result = Drained(written=len(stored), dead_lettered=len(undecodable) + len(refused))
+        result = Drained(len(stored), len(undecodable) + len(refused), len(lost))
         self._observer.drained(result)
         return result
 
@@ -101,17 +104,25 @@ class UsageWorker:
                 await anyio.sleep(idle_s)
 
     async def _store_all(self, deliveries: Sequence[Delivery]) -> list[Delivery]:
-        """Stores what it can; returns the deliveries the store refused."""
+        """Stores what it can; returns the deliveries that can't be stored. Raises
+        UsageStoreUnavailableError only when the store itself is down."""
         try:
             await self._store.insert_many(_events(deliveries))
             return []
         except InvalidUsageEventError:
             pass
+        except UsageStoreUnavailableError:
+            if not await self._store.reachable():
+                raise
         refused = []
         for delivery in deliveries:
             try:
                 await self._store.insert_many(_events([delivery]))
             except InvalidUsageEventError:
+                refused.append(delivery)
+            except UsageStoreUnavailableError:
+                if not await self._store.reachable():
+                    raise
                 refused.append(delivery)
         return refused
 

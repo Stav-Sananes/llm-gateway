@@ -205,3 +205,59 @@ async def test_the_worker_moves_events_from_redis_to_postgres(
     assert result == Drained(written=3, dead_lettered=1)
     assert await stored_rows(engine) == 3
     assert await redis.xlen(STREAM) == 0
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"requested_model": "fake\x00"},
+        {"requested_model": "\ud800"},
+        {"model": "x" * 2000},
+        {"charged_tokens": 2**63},
+    ],
+    ids=["nul", "surrogate", "long", "over-bigint"],
+)
+def test_decode_refuses_what_postgres_would(changes: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        decode(encode(a_usage_event(**changes)))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"requested_model": "fake\x00"}, {"requested_model": "\ud800"}],
+    ids=["nul", "surrogate"],
+)
+async def test_the_store_reports_refused_values_as_invalid_not_as_an_outage(
+    engine: AsyncEngine, changes: dict[str, object]
+) -> None:
+    # Anything else would make the worker retry the batch forever.
+    with pytest.raises(InvalidUsageEventError):
+        await PostgresUsageStore(engine).insert_many([a_usage_event(**changes)])
+
+
+async def test_token_counts_past_int32_are_stored(engine: AsyncEngine) -> None:
+    await PostgresUsageStore(engine).insert_many([a_usage_event(charged_tokens=2**40)])
+
+    assert await stored_rows(engine) == 1
+
+
+async def test_the_store_says_whether_postgres_answers(engine: AsyncEngine) -> None:
+    url = unused_local_url().replace("http://", "postgresql+asyncpg://u:p@")
+    down = build_engine(Settings(database_url=url, database_connect_timeout_s=0.5))
+    try:
+        assert await PostgresUsageStore(engine).reachable()
+        assert not await PostgresUsageStore(down).reachable()
+    finally:
+        await down.dispose()
+
+
+async def test_the_backlog_shows_what_waits_and_what_is_unacknowledged(redis: Redis) -> None:
+    queue = a_queue(redis)
+    await queue.ensure_group()
+    stream = RedisUsageStream(redis)
+    for _ in range(3):
+        await stream.record(a_usage_event())
+
+    await queue.take(1)
+
+    assert await queue.backlog() == (3, 1, 2)

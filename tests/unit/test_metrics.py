@@ -78,3 +78,12 @@ async def test_http_responses_are_counted_by_known_path_and_status(
     assert sample(metrics, "gateway_http_requests_total", path="/healthz", status="503") == 1
     # Unknown paths share one label, so a scanner can't grow the metric without bound.
     assert sample(metrics, "gateway_http_requests_total", path="other", status="404") == 1
+
+
+async def test_an_event_metrics_cannot_count_is_still_passed_on(metrics: GatewayMetrics) -> None:
+    inner = RecordedUsage()
+    odd = a_usage_event(prompt_tokens=-1)
+
+    await MeteredUsage(metrics, inner).record(odd)
+
+    assert inner.events == [odd]

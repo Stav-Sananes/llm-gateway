@@ -29,6 +29,13 @@ def test_parse_chunk_reads_usage_only_chunk() -> None:
     assert parse_chunk(payload) == CompletionChunk(usage=Usage(3, 4))
 
 
+def test_negative_usage_from_a_broken_upstream_is_clamped_to_zero() -> None:
+    # A negative count would refund the tenant's budget at settle.
+    payload = {"choices": [], "usage": {"prompt_tokens": -3, "completion_tokens": 4}}
+
+    assert parse_chunk(payload) == CompletionChunk(usage=Usage(0, 4))
+
+
 def test_wire_request_omits_unset_options() -> None:
     request = ChatRequest(model="m", messages=({"role": "user", "content": "x"},))
 

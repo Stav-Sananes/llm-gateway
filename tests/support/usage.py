@@ -76,7 +76,8 @@ class InMemoryUsageQueue:
 
 
 class InMemoryUsageStore:
-    """Refuses events with negative tokens, as the Postgres check constraint does."""
+    """Refuses events with negative tokens, as the Postgres check constraint does. Like
+    Postgres, it reports some refused values (a NUL in a string) as a generic failure."""
 
     def __init__(self, down: bool = False) -> None:
         self.events: dict[UUID, UsageEvent] = {}
@@ -87,5 +88,10 @@ class InMemoryUsageStore:
             raise UsageStoreUnavailableError("postgres down")
         if any(e.prompt_tokens < 0 or e.charged_tokens < 0 for e in events):
             raise InvalidUsageEventError("ck_usage_events_tokens_not_negative")
+        if any("\x00" in e.requested_model for e in events):
+            raise UsageStoreUnavailableError("DBAPIError")
         for event in events:
             self.events.setdefault(event.event_id, event)
+
+    async def reachable(self) -> bool:
+        return not self.down

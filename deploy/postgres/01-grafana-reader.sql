@@ -4,3 +4,5 @@
 CREATE ROLE grafana_reader LOGIN PASSWORD 'grafana_reader';
 GRANT CONNECT ON DATABASE gateway TO grafana_reader;
 GRANT USAGE ON SCHEMA public TO grafana_reader;
+-- Any dashboard viewer can run SQL through Grafana: keep it from loading the main database.
+ALTER ROLE grafana_reader SET statement_timeout = '5s';

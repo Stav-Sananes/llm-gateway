@@ -99,3 +99,25 @@ async def test_run_waits_out_an_outage_and_carries_on() -> None:
 
     assert len(store.events) == 1
     assert observer.drained_results[0] == Drained(written=1)
+
+
+async def test_an_event_that_fails_while_the_store_is_up_is_isolated_not_retried_forever() -> None:
+    # The store answers, but this batch fails with an error that looks like an outage.
+    poison = delivered(2, requested_model="m\x00")
+    queue, store = InMemoryUsageQueue(delivered(1), poison, delivered(3)), InMemoryUsageStore()
+
+    result = await UsageWorker(queue, store).drain_once()
+
+    assert result == Drained(written=2, dead_lettered=1)
+    assert queue.dead == [poison]
+
+
+async def test_an_entry_trimmed_before_it_was_stored_is_counted_lost_not_dead_lettered() -> None:
+    trimmed = Delivery("1-0", None, raw="")
+    queue = InMemoryUsageQueue(trimmed, delivered(2))
+
+    result = await UsageWorker(queue, InMemoryUsageStore()).drain_once()
+
+    assert result == Drained(written=1, lost=1)
+    assert queue.dead == []
+    assert sorted(queue.acked) == ["1-0", "2-0"]

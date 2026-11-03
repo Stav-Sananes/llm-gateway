@@ -4,10 +4,11 @@ Labels stay bounded: provider names come from config, paths from a fixed list, a
 metric carries a tenant or a model name a client can choose.
 """
 
+import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 
-from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 from prometheus_client.core import GaugeMetricFamily, Metric
 from prometheus_client.registry import Collector
 from starlette.requests import Request
@@ -18,6 +19,8 @@ from llm_gateway.routing.breaker import BreakerState, CircuitBreaker
 from llm_gateway.usage.model import UsageEvent
 from llm_gateway.usage.ports import UsageRecorder
 from llm_gateway.usage.worker import Drained
+
+logger = logging.getLogger(__name__)
 
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 NO_PROVIDER = "none"
@@ -89,14 +92,17 @@ class GatewayMetrics:
 
 
 class MeteredUsage:
-    """A UsageRecorder that counts each event, then passes it on."""
+    """A UsageRecorder that counts each event, then passes it on. Never raises."""
 
     def __init__(self, metrics: GatewayMetrics, inner: UsageRecorder) -> None:
         self._metrics = metrics
         self._inner = inner
 
     async def record(self, event: UsageEvent) -> None:
-        self._metrics.observe_usage(event)
+        try:
+            self._metrics.observe_usage(event)
+        except ValueError:  # e.g. a negative count from a misbehaving upstream
+            logger.warning("usage event %s not counted in metrics", event.event_id)
         await self._inner.record(event)
 
 
@@ -160,13 +166,32 @@ class WorkerMetrics:
         self.dead_lettered = Counter(
             "usage_worker_events_dead_lettered", "Usage events parked", registry=registry
         )
+        self.lost = Counter(
+            "usage_worker_events_lost",
+            "Usage events trimmed before they were stored",
+            registry=registry,
+        )
         self.failures = Counter(
             "usage_worker_failures", "Batches not stored: queue or store down", registry=registry
         )
+        # Alert on these before the stream reaches its cap and starts trimming.
+        self.stream_length = Gauge(
+            "usage_stream_length", "Entries in the usage stream", registry=registry
+        )
+        self.pending = Gauge(
+            "usage_stream_pending", "Delivered, not yet acknowledged", registry=registry
+        )
+        self.lag = Gauge("usage_stream_lag", "Never delivered yet", registry=registry)
 
     def drained(self, result: Drained) -> None:
         self.written.inc(result.written)
         self.dead_lettered.inc(result.dead_lettered)
+        self.lost.inc(result.lost)
+
+    def backlog(self, length: int, pending: int, lag: int) -> None:
+        self.stream_length.set(length)
+        self.pending.set(pending)
+        self.lag.set(lag)
 
     def failed(self, error: Exception) -> None:
         self.failures.inc()

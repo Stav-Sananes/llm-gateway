@@ -4,7 +4,7 @@ import logging
 import signal
 import socket
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import anthropic
 import anyio
@@ -43,7 +43,7 @@ from llm_gateway.storage.usage_stream import RedisUsageQueue, RedisUsageStream
 from llm_gateway.tenancy.auth import Authenticator
 from llm_gateway.tools.gateway import ToolGateway
 from llm_gateway.tools.model import ToolLimits
-from llm_gateway.usage.ports import UsageRecorder
+from llm_gateway.usage.ports import UsageQueueUnavailableError, UsageRecorder
 from llm_gateway.usage.worker import UsageWorker
 
 logger = logging.getLogger(__name__)
@@ -193,6 +193,7 @@ def build_app(settings: Settings) -> FastAPI:
         lifespan=lifespan,
         mcp_app=mcp_app,
         metrics=metrics,
+        max_request_bytes=settings.max_request_bytes,
     )
     if tracer_provider is not None:
         telemetry.instrument(app, upstream_client)
@@ -207,6 +208,7 @@ async def run_usage_worker(settings: Settings) -> None:
     """The usage worker process: drain the usage stream into Postgres until SIGTERM/SIGINT.
 
     Killed instead, nothing is lost: unacknowledged events are delivered again."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     registry = CollectorRegistry()
     observer = WorkerMetrics(registry)
     prometheus_client.start_http_server(settings.usage_worker_metrics_port, registry=registry)
@@ -223,6 +225,7 @@ async def run_usage_worker(settings: Settings) -> None:
     try:
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(worker.run)
+            tasks.start_soon(_report_backlog, queue, observer)
             with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGINT) as signals:
                 async for _ in signals:
                     logger.info("usage worker stopping")
@@ -231,3 +234,11 @@ async def run_usage_worker(settings: Settings) -> None:
     finally:
         await redis.aclose()
         await engine.dispose()
+
+
+async def _report_backlog(queue: RedisUsageQueue, metrics: WorkerMetrics) -> None:
+    while True:
+        # When Redis is down, the worker loop already reports it.
+        with suppress(UsageQueueUnavailableError):
+            metrics.backlog(*await queue.backlog())
+        await anyio.sleep(15)

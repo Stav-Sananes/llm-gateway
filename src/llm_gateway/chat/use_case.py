@@ -76,11 +76,13 @@ class ChatCompletions:
             # Shielded: when the client disconnects, the request is cancelled and this runs
             # inside the cancellation; unshielded, the settle would never happen and the
             # tenant would stay charged the worst case.
-            with anyio.move_on_after(FINISH_TIMEOUT_S, shield=True):
+            with anyio.move_on_after(FINISH_TIMEOUT_S, shield=True) as finishing:
                 await chunks.aclose()
                 charged = _tokens_used(reservation, meter.started, meter.usage)
                 await self._settle(reservation, charged)
                 await self._usage.record(meter.event(reservation, charged))
+            if finishing.cancelled_caught:
+                logger.error("request finish took over %ss; settle or usage lost", FINISH_TIMEOUT_S)
 
     async def _settle(self, reservation: Reservation, used: int) -> None:
         try:

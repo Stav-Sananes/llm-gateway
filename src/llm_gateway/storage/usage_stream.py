@@ -117,6 +117,18 @@ class RedisUsageQueue:
             raise UsageQueueUnavailableError(type(error).__name__) from error
         await self.ack([delivery.delivery_id])
 
+    async def backlog(self) -> tuple[int, int, int]:
+        """(entries in the stream, delivered but unacknowledged, never delivered)."""
+        try:
+            length = await self._redis.xlen(STREAM)
+            groups = await self._redis.xinfo_groups(STREAM)
+        except _UNAVAILABLE as error:
+            raise UsageQueueUnavailableError(type(error).__name__) from error
+        for group in groups:
+            if _text(group.get("name", b"")) == GROUP:
+                return int(length), int(group.get("pending") or 0), int(group.get("lag") or 0)
+        return int(length), 0, int(length)
+
     async def _entries(self, count: int) -> list[tuple[Any, Any]]:
         return await self._own_pending(count) or await self._stale(count) or await self._new(count)
 
@@ -170,9 +182,9 @@ def decode(raw: str) -> UsageEvent:
     return UsageEvent(
         event_id=UUID(data["event_id"]),
         tenant_id=UUID(data["tenant_id"]),
-        requested_model=str(data["requested_model"]),
-        provider=_optional_str(data["provider"]),
-        model=_optional_str(data["model"]),
+        requested_model=_name(data["requested_model"]),
+        provider=None if data["provider"] is None else _name(data["provider"]),
+        model=None if data["model"] is None else _name(data["model"]),
         outcome=Outcome(data["outcome"]),
         prompt_tokens=_count(data["prompt_tokens"]),
         completion_tokens=_count(data["completion_tokens"]),
@@ -203,11 +215,21 @@ def _text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-def _optional_str(value: Any) -> str | None:
-    return None if value is None else str(value)
+_MAX_NAME_CHARS = 1024
+_MAX_COUNT = 2**63 - 1  # BIGINT
+
+
+def _name(value: Any) -> str:
+    """A model or provider name Postgres will take: text, bounded, no NUL, valid UTF-8."""
+    if not isinstance(value, str) or not value or len(value) > _MAX_NAME_CHARS:
+        raise ValueError(f"not a name: {value!r:.80}")
+    if "\x00" in value:
+        raise ValueError("name contains NUL")
+    value.encode("utf-8")  # UnicodeEncodeError (a ValueError) on a lone surrogate
+    return value
 
 
 def _count(value: Any) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= _MAX_COUNT:
         raise ValueError(f"not a token count: {value!r}")
     return value

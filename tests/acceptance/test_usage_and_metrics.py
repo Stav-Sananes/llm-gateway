@@ -114,3 +114,15 @@ def test_a_client_leaving_mid_stream_still_settles_and_records_usage(services: S
     assert event.outcome == "interrupted"
     assert event.charged_tokens > 500  # the reservation: no usage was reported
     assert event.duration_s < 5  # ended at the hang-up, not after the whole 10 s answer
+
+
+def test_a_model_name_that_would_poison_the_usage_queue_is_refused_at_the_edge(
+    services: Settings,
+) -> None:
+    with gateway(services) as client:
+        response = client.post("/v1/chat/completions", json=HELLO | {"model": "fake\u0000"})
+        fine = client.post("/v1/chat/completions", json=HELLO)
+
+    assert response.status_code == 400
+    assert fine.status_code == 200
+    assert [row["requested_model"] for row in drain_usage_into_postgres(services)] == ["fake-model"]

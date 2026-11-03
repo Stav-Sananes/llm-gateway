@@ -65,9 +65,12 @@ services:
       interval: 2s
       retries: 15
 
-  # API-key cache only: losing it costs a Postgres lookup, so no volume.
+  # Holds the key cache, rate limits, budgets and the usage queue. Append-only file, synced
+  # every second, on a volume: a crash loses at most a second of queued usage events.
   redis:
     image: redis:8.10.3-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes: ["redis:/data"]
     # Localhost only: a cache entry is trusted as much as a Postgres row.
     ports: ["127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"]
     healthcheck:
@@ -90,6 +93,7 @@ services:
   usage-worker:
     image: llm-gateway:dev
     command: ["llm-gateway", "usage-worker"]
+    restart: unless-stopped
     environment:
       GATEWAY_DATABASE_URL: *database_url
       GATEWAY_REDIS_URL: redis://redis:6379/0
@@ -135,3 +139,4 @@ services:
 volumes:
   ollama: {}
   postgres: {}
+  redis: {}

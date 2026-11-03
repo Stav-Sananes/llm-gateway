@@ -28,6 +28,11 @@ class Delivery:
     event: UsageEvent | None
     raw: str = ""
 
+    @property
+    def lost(self) -> bool:
+        """The entry was trimmed from the stream before it was stored: nothing to keep."""
+        return self.event is None and not self.raw
+
 
 class UsageQueue(Protocol):
     async def take(self, max_events: int) -> Sequence[Delivery]:
@@ -45,6 +50,10 @@ class UsageStore(Protocol):
     async def insert_many(self, events: Sequence[UsageEvent]) -> None:
         """All or nothing, idempotent on event_id. Raises UsageStoreUnavailableError, or
         InvalidUsageEventError when the store refuses the data itself."""
+        ...
+
+    async def reachable(self) -> bool:
+        """Does the store answer at all? Tells a refused batch from a down store."""
         ...
 
 
