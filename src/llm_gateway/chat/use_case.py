@@ -4,17 +4,27 @@ Limits are checked before the first chunk exists, so a refusal is still a plain 
 error. Tokens are reserved for the worst case up front and settled against the
 provider's reported usage when the stream ends, however it ends; then one usage event
 records what happened.
+
+Between the budget and the provider sits the semantic cache: a hit is replayed for free,
+and a miss's answer is remembered once it has finished cleanly.
 """
 
 import logging
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 import anyio
 
+from llm_gateway.cache.model import (
+    DEFAULT_DIRECTIVES,
+    MAX_CACHED_ANSWER_CHARS,
+    CachedAnswer,
+    CacheDirectives,
+)
+from llm_gateway.cache.semantic import Hit, Lookup, Miss, SemanticCache, replay
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, Origin, Usage
 from llm_gateway.chat.ports import ChatProvider, ChunkStream
 from llm_gateway.limits.estimate import estimate_prompt_tokens
@@ -46,6 +56,7 @@ class ChatCompletions:
         usage: UsageRecorder = NO_USAGE_RECORDING,
         clock: Callable[[], float] = time.monotonic,
         finish_timeout_s: float = FINISH_TIMEOUT_S,
+        cache: SemanticCache | None = None,
     ) -> None:
         self._provider = provider
         self._rate_limiter = rate_limiter
@@ -54,8 +65,14 @@ class ChatCompletions:
         self._usage = usage
         self._clock = clock
         self._finish_timeout_s = finish_timeout_s
+        self._cache = cache
 
-    async def start(self, request: ChatRequest, tenant: Tenant) -> ChunkStream:
+    async def start(
+        self,
+        request: ChatRequest,
+        tenant: Tenant,
+        directives: CacheDirectives = DEFAULT_DIRECTIVES,
+    ) -> ChunkStream:
         """Raises RateLimitedError, BudgetExhaustedError or BudgetUnavailableError up front."""
         await self._rate_limiter.acquire(tenant.id)
         # Cap the completion upstream too, so the reservation really is the worst case.
@@ -63,16 +80,30 @@ class ChatCompletions:
         worst_case = estimate_prompt_tokens(request.messages) + max_tokens
         reservation = await self._budget.reserve(tenant.id, worst_case)
         meter = _Meter(request.model, datetime.now(UTC), self._clock(), self._clock)
-        return self._metered(
-            self._provider.stream(replace(request, max_tokens=max_tokens)), reservation, meter
+        # The cache keys on the request as the client sent it, max_tokens included.
+        lookup = await self._look_up(tenant, request, directives)
+        chunks = (
+            replay(lookup)
+            if isinstance(lookup, Hit)
+            else self._provider.stream(replace(request, max_tokens=max_tokens))
         )
+        return self._metered(chunks, reservation, meter, lookup)
+
+    async def _look_up(
+        self, tenant: Tenant, request: ChatRequest, directives: CacheDirectives
+    ) -> Lookup:
+        if self._cache is None:
+            return None
+        return await self._cache.look_up(tenant.id, request, directives)
 
     async def _metered(
-        self, chunks: ChunkStream, reservation: Reservation, meter: "_Meter"
+        self, chunks: ChunkStream, reservation: Reservation, meter: "_Meter", lookup: Lookup
     ) -> ChunkStream:
+        answer = _AnswerText(keep=isinstance(lookup, Miss))
         try:
             async for chunk in chunks:
                 meter.saw(chunk)
+                answer.saw(chunk)
                 yield chunk
         finally:
             # Shielded: when the client disconnects, the request is cancelled and this runs
@@ -83,16 +114,48 @@ class ChatCompletions:
                 charged = _tokens_used(reservation, meter.started, meter.usage)
                 await self._settle(reservation, charged)
                 await self._usage.record(meter.event(reservation, charged))
+                if isinstance(lookup, Miss) and meter.usage is not None and meter.origin:
+                    await self._remember(lookup, answer.finished(meter.origin.model))
             if finishing.cancelled_caught:
                 logger.error(
                     "request finish took over %ss; settle or usage lost", self._finish_timeout_s
                 )
+
+    async def _remember(self, miss: Miss, answer: CachedAnswer | None) -> None:
+        if self._cache is not None and answer is not None:
+            await self._cache.remember(miss, answer)
 
     async def _settle(self, reservation: Reservation, used: int) -> None:
         try:
             await self._budget.settle(reservation, used)
         except BudgetUnavailableError:
             logger.warning("token budget unavailable at settle; reservation stays charged")
+
+
+@dataclass
+class _AnswerText:
+    """The streamed answer, collected only when it may go into the cache."""
+
+    keep: bool
+    parts: list[str] = field(default_factory=list)
+    length: int = 0
+    finish_reason: str | None = None
+
+    def saw(self, chunk: CompletionChunk) -> None:
+        if not self.keep:
+            return
+        self.length += len(chunk.content)
+        if self.length > MAX_CACHED_ANSWER_CHARS:  # too long to keep: stop collecting
+            self.keep, self.parts = False, []
+            return
+        if chunk.content:
+            self.parts.append(chunk.content)
+        self.finish_reason = chunk.finish_reason or self.finish_reason
+
+    def finished(self, model: str) -> CachedAnswer | None:
+        if not self.keep or self.finish_reason is None:
+            return None
+        return CachedAnswer("".join(self.parts), self.finish_reason, model)
 
 
 @dataclass

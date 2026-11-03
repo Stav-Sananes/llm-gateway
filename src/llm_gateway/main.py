@@ -3,7 +3,7 @@
 import logging
 import signal
 import socket
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 
 import anthropic
@@ -13,12 +13,14 @@ import prometheus_client
 import uvicorn
 from fastapi import FastAPI
 from prometheus_client import CollectorRegistry
+from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from llm_gateway import telemetry
 from llm_gateway.audit.log import AuditLog
 from llm_gateway.authz.cedar_engine import CedarPolicyEngine, load_policies
+from llm_gateway.cache.semantic import CacheSettings, SemanticCache
 from llm_gateway.chat.ports import ChatProvider
 from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.config import Settings
@@ -27,14 +29,22 @@ from llm_gateway.http.mcp_endpoint import build_mcp_app, build_mcp_server
 from llm_gateway.limits.policies import FailOpenRateLimiter, UnlimitedBudget
 from llm_gateway.limits.ports import TokenBudget
 from llm_gateway.limits.token_bucket import InMemoryRateLimiter
-from llm_gateway.metrics import CircuitStates, GatewayMetrics, MeteredUsage, WorkerMetrics
+from llm_gateway.metrics import (
+    CacheMetrics,
+    CircuitStates,
+    GatewayMetrics,
+    MeteredUsage,
+    WorkerMetrics,
+)
 from llm_gateway.providers.anthropic import AnthropicProvider
+from llm_gateway.providers.embeddings import OpenAICompatibleEmbedder
 from llm_gateway.providers.mcp_upstreams import HttpMcpUpstreams
 from llm_gateway.providers.openai_compatible import OpenAICompatibleProvider
 from llm_gateway.routing.breaker import CircuitBreaker, GuardedProvider
 from llm_gateway.routing.router import Router, Target
 from llm_gateway.storage.audit_store import PostgresAuditStore
 from llm_gateway.storage.key_cache import RedisKeyCache
+from llm_gateway.storage.qdrant_cache import QdrantAnswerStore
 from llm_gateway.storage.rate_limiter import RedisRateLimiter
 from llm_gateway.storage.tenant_store import PostgresTenantStore
 from llm_gateway.storage.token_budget import RedisTokenBudget
@@ -130,8 +140,47 @@ def build_redis(settings: Settings) -> Redis:
     )
 
 
+def build_cache(
+    settings: Settings, metrics: GatewayMetrics
+) -> tuple[SemanticCache | None, list[Callable[[], Awaitable[None]]]]:
+    """The semantic cache, if enabled, and how to close its clients."""
+    if not settings.cache_enabled:
+        return None, []
+    timeout = httpx.Timeout(settings.cache_timeout_s)
+    embeddings_client = httpx.AsyncClient(
+        base_url=settings.cache_embedding_base_url or settings.upstream_base_url, timeout=timeout
+    )
+    # No version check: it's a network call at construction, and the gateway must start
+    # (and serve, uncached) without Qdrant.
+    qdrant = AsyncQdrantClient(
+        url=settings.qdrant_url,
+        timeout=max(1, int(settings.cache_timeout_s)),
+        check_compatibility=False,
+    )
+    cache = SemanticCache(
+        OpenAICompatibleEmbedder(
+            embeddings_client, settings.cache_embedding_model, settings.cache_embedding_dims
+        ),
+        QdrantAnswerStore(qdrant, settings.cache_embedding_dims),
+        CircuitBreaker(
+            "semantic-cache", settings.breaker_failure_threshold, settings.breaker_reset_s
+        ),
+        CacheSettings(
+            similarity_threshold=settings.cache_similarity_threshold,
+            ttl_s=settings.cache_ttl_s,
+            timeout_s=settings.cache_timeout_s,
+        ),
+        observer=CacheMetrics(metrics, settings.cache_similarity_threshold),
+    )
+    return cache, [embeddings_client.aclose, qdrant.close]
+
+
 def build_chat(
-    settings: Settings, provider: ChatProvider, redis: Redis, usage: UsageRecorder
+    settings: Settings,
+    provider: ChatProvider,
+    redis: Redis,
+    usage: UsageRecorder,
+    cache: SemanticCache | None = None,
 ) -> ChatCompletions:
     burst, per_s = settings.rate_limit_burst, settings.rate_limit_per_s
     rate_limiter = FailOpenRateLimiter(
@@ -142,7 +191,9 @@ def build_chat(
         if settings.token_budget_per_day is None
         else RedisTokenBudget(redis, settings.token_budget_per_day)
     )
-    return ChatCompletions(provider, rate_limiter, budget, settings.default_max_tokens, usage)
+    return ChatCompletions(
+        provider, rate_limiter, budget, settings.default_max_tokens, usage, cache=cache
+    )
 
 
 def build_app(settings: Settings) -> FastAPI:
@@ -173,6 +224,8 @@ def build_app(settings: Settings) -> FastAPI:
         await upstream_client.aclose()
         if anthropic_client is not None:
             await anthropic_client.close()
+        for close in cache_clients:
+            await close()
         await redis.aclose()
         await engine.dispose()
         if tracer_provider is not None:
@@ -186,8 +239,9 @@ def build_app(settings: Settings) -> FastAPI:
             redis, settings.usage_stream_max_len, on_dropped=metrics.usage_events_dropped.inc
         ),
     )
+    cache, cache_clients = build_cache(settings, metrics)
     app = create_app(
-        build_chat(settings, router, redis, usage),
+        build_chat(settings, router, redis, usage, cache),
         authenticator,
         breakers,
         lifespan=lifespan,

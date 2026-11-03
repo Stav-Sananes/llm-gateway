@@ -509,6 +509,130 @@
           "rawSql": "SELECT coalesce(provider, 'none') AS provider,\n       outcome,\n       count(*) AS requests,\n       round(avg(time_to_first_chunk_s)::numeric, 3) AS avg_first_chunk_s\nFROM usage_events\nWHERE $__timeFilter(started_at)\nGROUP BY 1, 2\nORDER BY requests DESC"
         }
       ]
+    },
+    {
+      "type": "row",
+      "title": "Semantic cache (Prometheus)",
+      "id": 14,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache hit rate",
+      "id": 15,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Hits over eligible lookups (hit + miss). Ineligible requests (tools, temperature > 0.3, opt-out) and outages are shown apart.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "legendFormat": "hit rate",
+          "expr": "sum(rate(gateway_cache_lookups_total{result=\"hit\"}[5m])) / sum(rate(gateway_cache_lookups_total{result=~\"hit|miss\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache lookups by result",
+      "id": 16,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "legendFormat": "{{result}}",
+          "expr": "sum by (result) (rate(gateway_cache_lookups_total[1m]))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Hit similarity vs threshold",
+      "id": 17,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Hits scoring just above the threshold are where false hits hide.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0.9,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "legendFormat": "p10 hit score",
+          "expr": "histogram_quantile(0.1, sum by (le) (rate(gateway_cache_hit_score_bucket[15m])))"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "legendFormat": "threshold",
+          "expr": "max(gateway_cache_similarity_threshold)"
+        }
+      ]
     }
   ]
 }

@@ -5,6 +5,7 @@ import pytest
 from llm_gateway.config import Settings
 from tests.support.backing_services import reset
 from tests.support.postgres import migrated_postgres
+from tests.support.qdrant import running_qdrant
 from tests.support.redis import running_redis
 
 
@@ -38,3 +39,10 @@ def services(postgres_url: str, redis_url: str, monkeypatch: pytest.MonkeyPatch)
     settings = Settings()
     reset(settings)
     return settings
+
+
+@pytest.fixture(scope="session")
+def qdrant_url() -> Iterator[str]:
+    """One Qdrant container per test run, started only if a test asks for it."""
+    with running_qdrant() as url:
+        yield url

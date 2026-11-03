@@ -5,7 +5,10 @@ fixed, known latency and can misbehave on demand (error status, broken stream).
 """
 
 import asyncio
+import hashlib
 import json
+import math
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,11 +26,14 @@ class FakeLlmScript:
     fail_message: str = "scripted failure"
     break_after_chunks: int | None = None
     omit_done: bool = False  # end the stream cleanly but without the [DONE] line
+    embedding_dims: int = 64
+    embed_fail_status: int | None = None
 
 
 @dataclass
 class FakeLlmLog:
     requests: list[dict[str, Any]] = field(default_factory=list)
+    embeddings: list[str] = field(default_factory=list)  # every text it was asked to embed
 
 
 class BrokenStreamError(Exception):
@@ -48,7 +54,28 @@ def create_fake_llm(script: FakeLlmScript, log: FakeLlmLog | None = None) -> Fas
             )
         return StreamingResponse(_stream(script, body["model"]), media_type="text/event-stream")
 
+    @app.post("/v1/embeddings")
+    async def embeddings(request: Request) -> Response:
+        body: dict[str, Any] = await request.json()
+        request_log.embeddings.append(body["input"])
+        if script.embed_fail_status is not None:
+            return JSONResponse(
+                {"error": {"message": "down"}}, status_code=script.embed_fail_status
+            )
+        vector = bag_of_words(body["input"], script.embedding_dims)
+        return JSONResponse({"object": "list", "data": [{"index": 0, "embedding": vector}]})
+
     return app
+
+
+def bag_of_words(text: str, dims: int) -> list[float]:
+    """A deterministic stand-in for an embedding model: the same words (in any case, with
+    any punctuation) give the same vector; different words point elsewhere."""
+    vector = [0.0] * dims
+    for word in re.findall(r"[a-z0-9]+", text.lower()):
+        vector[int(hashlib.sha256(word.encode()).hexdigest(), 16) % dims] += 1.0
+    norm = math.sqrt(sum(x * x for x in vector)) or 1.0
+    return [x / norm for x in vector]
 
 
 async def _stream(script: FakeLlmScript, model: str) -> AsyncIterator[str]:
