@@ -9,7 +9,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
-from llm_gateway.chat.model import ChatRequest
+from llm_gateway.chat.model import ChatRequest, Origin
 from llm_gateway.chat.ports import ChatProvider, ChunkStream, ProviderUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class Router:
                 failures.append(f"{target.provider}: {reason}")
                 continue
             try:
-                yield first
+                yield replace(first, origin=Origin(target.provider, target.model))
                 async for chunk in chunks:
                     yield chunk
             finally:

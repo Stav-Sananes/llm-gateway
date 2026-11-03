@@ -93,9 +93,10 @@ def parse_chunk(payload: Mapping[str, Any]) -> CompletionChunk:
 def _parse_usage(raw: Mapping[str, Any] | None) -> Usage | None:
     if not raw:
         return None
+    # Clamped: a negative count from a broken upstream would refund the tenant's budget.
     return Usage(
-        prompt_tokens=int(raw.get("prompt_tokens", 0)),
-        completion_tokens=int(raw.get("completion_tokens", 0)),
+        prompt_tokens=max(0, int(raw.get("prompt_tokens", 0))),
+        completion_tokens=max(0, int(raw.get("completion_tokens", 0))),
     )
 
 

@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     mcp_max_argument_bytes: int = Field(default=64 * 1024, gt=0)
     mcp_max_result_bytes: int = Field(default=1024 * 1024, gt=0)
 
+    # Request bodies over this get a 413 before they're read (chat and /mcp alike).
+    max_request_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
+    # Usage events wait in a Redis Stream for the usage worker; past this length the oldest
+    # are trimmed (the worker has been down too long).
+    usage_stream_max_len: int = Field(default=100_000, gt=0)
+    usage_worker_metrics_port: int = 9101
+
     database_url: str = "postgresql+asyncpg://gateway:gateway@localhost:5433/gateway"
     database_connect_timeout_s: float = 2.0
     database_statement_timeout_s: float = 5.0

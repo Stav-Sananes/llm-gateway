@@ -1,0 +1,22 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+  # Per-tenant usage and tool-call decisions come from Postgres, not Prometheus: tenant
+  # labels on metrics would grow without bound.
+  - name: Postgres
+    uid: postgres
+    type: grafana-postgresql-datasource
+    url: postgres:5432
+    user: grafana_reader
+    jsonData:
+      database: gateway
+      sslmode: disable
+      postgresVersion: 1800
+    secureJsonData:
+      password: grafana_reader

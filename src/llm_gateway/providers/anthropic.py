@@ -121,7 +121,7 @@ async def chunks_from(events: Any) -> ChunkStream:
             stop_reason = event.delta.stop_reason
             yield CompletionChunk(finish_reason=_FINISH_REASONS.get(stop_reason or "", "stop"))
             # Output tokens include thinking, which the tenant pays for too.
-            completion_tokens = event.usage.output_tokens
+            completion_tokens = max(0, int(event.usage.output_tokens or 0))
             yield CompletionChunk(usage=Usage(prompt_tokens, completion_tokens))
             return
     raise ProviderUnavailableError("anthropic stream ended before the message was finished")
@@ -173,10 +173,13 @@ def _text_of(message: Message) -> str:
 
 def _prompt_tokens(usage: Any) -> int:
     # Cached prompt tokens are reported separately; the prompt is all three.
-    return int(
-        (getattr(usage, "input_tokens", 0) or 0)
-        + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
-        + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+    return max(
+        0,
+        int(
+            (getattr(usage, "input_tokens", 0) or 0)
+            + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+            + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+        ),
     )
 
 

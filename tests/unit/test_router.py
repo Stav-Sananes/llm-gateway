@@ -1,6 +1,6 @@
 import pytest
 
-from llm_gateway.chat.model import ChatRequest, CompletionChunk, collect
+from llm_gateway.chat.model import ChatRequest, CompletionChunk, Origin, collect
 from llm_gateway.chat.ports import ProviderRejectedError, ProviderUnavailableError
 from llm_gateway.routing.router import Router, Target
 from tests.support.providers import ScriptedProvider
@@ -94,3 +94,12 @@ async def test_closing_the_stream_early_releases_the_serving_provider() -> None:
 def test_routes_naming_an_unknown_provider_are_refused_at_startup() -> None:
     with pytest.raises(ValueError, match="nope"):
         Router({"a": ScriptedProvider(FROM_A)}, {"x": [Target("nope", "m")]}, "a")
+
+
+async def test_the_first_chunk_a_target_serves_names_it() -> None:
+    a = ScriptedProvider((), fail_after=True)
+    b = ScriptedProvider((CompletionChunk(content="x"), CompletionChunk(content="y")))
+
+    chunks = [chunk async for chunk in router(a, b).stream(a_request("smart"))]
+
+    assert [chunk.origin for chunk in chunks] == [Origin("b", "b-small"), None]

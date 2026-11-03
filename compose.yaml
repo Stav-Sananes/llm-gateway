@@ -56,15 +56,21 @@ services:
     # Localhost only: anyone who can write here can mint access (see docs/design/03).
     ports: ["127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"]
     # Postgres 18 images keep data under /var/lib/postgresql/<major>/, so mount the parent.
-    volumes: ["postgres:/var/lib/postgresql"]
+    # The init script (Grafana's read-only role) runs only when the volume is first created.
+    volumes:
+      - postgres:/var/lib/postgresql
+      - ./deploy/postgres:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "gateway"]
       interval: 2s
       retries: 15
 
-  # API-key cache only: losing it costs a Postgres lookup, so no volume.
+  # Holds the key cache, rate limits, budgets and the usage queue. Append-only file, synced
+  # every second, on a volume: a crash loses at most a second of queued usage events.
   redis:
     image: redis:8.10.3-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes: ["redis:/data"]
     # Localhost only: a cache entry is trusted as much as a Postgres row.
     ports: ["127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"]
     healthcheck:
@@ -82,6 +88,55 @@ services:
       postgres:
         condition: service_healthy
 
+  # Drains usage events from the Redis Stream into Postgres. Safe to kill: anything it
+  # hadn't acknowledged is delivered again.
+  usage-worker:
+    image: llm-gateway:dev
+    command: ["llm-gateway", "usage-worker"]
+    restart: unless-stopped
+    environment:
+      GATEWAY_DATABASE_URL: *database_url
+      GATEWAY_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # One-shot, after migrating: lets Grafana's read-only role read the dashboard's tables.
+  grafana-grants:
+    image: postgres:18.6-alpine
+    environment:
+      PGPASSWORD: gateway
+    command: ["psql", "-h", "postgres", "-U", "gateway", "-d", "gateway", "-v", "ON_ERROR_STOP=1", "-f", "/grants/grafana-grants.sql"]
+    volumes: ["./deploy/postgres-grants:/grants:ro"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes: ["./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["127.0.0.1:9090:9090"]
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      # Local demo: anonymous viewers, no login. Never like this anywhere shared.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/gateway.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on:
+      prometheus:
+        condition: service_started
+      grafana-grants:
+        condition: service_completed_successfully
+
 volumes:
   ollama: {}
   postgres: {}
+  redis: {}

@@ -1,11 +1,13 @@
-"""Postgres schema for tenants and API keys (SQLAlchemy Core). The migrations create it."""
+"""Postgres schema (SQLAlchemy Core). The migrations create it; a test checks they agree."""
 
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     Column,
     DateTime,
+    Float,
     ForeignKey,
+    Index,
     MetaData,
     PrimaryKeyConstraint,
     Table,
@@ -65,6 +67,32 @@ audit_events = Table(
     PrimaryKeyConstraint("tenant_id", "seq"),
     # verify starts at seq 1; rows below it could never be checked, so they can't exist.
     CheckConstraint("seq > 0", name="ck_audit_events_seq_positive"),
+)
+
+# No foreign key to tenants: an event the worker can't insert would block the queue behind
+# it. Usage is analytics; the budget in Redis is what enforces limits.
+usage_events = Table(
+    "usage_events",
+    metadata,
+    Column("event_id", Uuid, primary_key=True),  # the worker may deliver an event twice
+    Column("tenant_id", Uuid, nullable=False),
+    Column("requested_model", Text, nullable=False),
+    Column("provider", Text),
+    Column("model", Text),
+    Column("outcome", Text, nullable=False),
+    Column("prompt_tokens", BigInteger, nullable=False),
+    Column("completion_tokens", BigInteger, nullable=False),
+    Column("charged_tokens", BigInteger, nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("duration_s", Float, nullable=False),
+    Column("time_to_first_chunk_s", Float),
+    Column("recorded_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    CheckConstraint(
+        "prompt_tokens >= 0 AND completion_tokens >= 0 AND charged_tokens >= 0",
+        name="ck_usage_events_tokens_not_negative",
+    ),
+    # Per-tenant usage over a time range: the dashboard's and billing's question.
+    Index("ix_usage_events_tenant_id_started_at", "tenant_id", "started_at"),
 )
 
 TENANT_NAME_UNIQUE = "uq_tenants_name"
