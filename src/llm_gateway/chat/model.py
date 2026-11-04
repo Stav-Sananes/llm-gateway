@@ -17,6 +17,7 @@ class ChatRequest:
     messages: Sequence[Message]
     max_tokens: int | None = None
     temperature: float | None = None
+    has_tools: bool = False  # the client offered tools: its answer may be a tool call
 
 
 @dataclass(frozen=True)

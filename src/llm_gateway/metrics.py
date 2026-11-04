@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from llm_gateway.cache.semantic import LookupResult
 from llm_gateway.routing.breaker import BreakerState, CircuitBreaker
 from llm_gateway.usage.model import UsageEvent
 from llm_gateway.usage.ports import UsageRecorder
@@ -70,6 +71,28 @@ class GatewayMetrics:
             "Until the first chunk",
             ["provider"],
             buckets=_LLM_BUCKETS,
+            registry=registry,
+        )
+        self.cache_lookups = Counter(
+            "gateway_cache_lookups",
+            "Semantic cache lookups by result",
+            ["result"],
+            registry=registry,
+        )
+        self.cache_hit_score = Histogram(
+            "gateway_cache_hit_score",
+            "Similarity of the questions on a cache hit",
+            buckets=(0.9, 0.92, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995, 1.0),
+            registry=registry,
+        )
+        self.cache_writes_dropped = Counter(
+            "gateway_cache_writes_dropped",
+            "Answers not cached: the write queue was full",
+            registry=registry,
+        )
+        self.cache_threshold = Gauge(
+            "gateway_cache_similarity_threshold",
+            "Minimum similarity for a cache hit",
             registry=registry,
         )
         self.usage_events_dropped = Counter(
@@ -195,3 +218,19 @@ class WorkerMetrics:
 
     def failed(self, error: Exception) -> None:
         self.failures.inc()
+
+
+class CacheMetrics:
+    """The semantic cache's CacheObserver."""
+
+    def __init__(self, metrics: GatewayMetrics, threshold: float) -> None:
+        self._metrics = metrics
+        metrics.cache_threshold.set(threshold)
+
+    def looked_up(self, result: LookupResult, score: float | None) -> None:
+        self._metrics.cache_lookups.labels(result.value).inc()
+        if score is not None:
+            self._metrics.cache_hit_score.observe(score)
+
+    def write_dropped(self) -> None:
+        self._metrics.cache_writes_dropped.inc()

@@ -50,6 +50,20 @@ class Settings(BaseSettings):
     mcp_max_argument_bytes: int = Field(default=64 * 1024, gt=0)
     mcp_max_result_bytes: int = Field(default=1024 * 1024, gt=0)
 
+    # Semantic cache (Qdrant + an embedding model). Off unless enabled; when Qdrant or the
+    # embedder is down, requests go on uncached.
+    cache_enabled: bool = False
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_api_key: SecretStr | None = None
+    # Embeddings come from an OpenAI-compatible /embeddings endpoint; unset uses upstream_base_url.
+    cache_embedding_base_url: str | None = None
+    cache_embedding_model: str = "nomic-embed-text"
+    cache_embedding_dims: int = Field(default=768, gt=0)
+    cache_similarity_threshold: float = Field(default=0.95, gt=0, le=1)
+    cache_ttl_s: float = Field(default=3600.0, gt=0)
+    # Embedding the question and searching Qdrant, together, before going uncached.
+    cache_timeout_s: float = Field(default=1.0, gt=0)
+
     # Request bodies over this get a 413 before they're read (chat and /mcp alike).
     max_request_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
     # Usage events wait in a Redis Stream for the usage worker; past this length the oldest

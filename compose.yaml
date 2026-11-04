@@ -9,6 +9,11 @@ services:
       GATEWAY_DATABASE_URL: &database_url postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
       GATEWAY_REDIS_URL: redis://redis:6379/0
       GATEWAY_TRACING_ENABLED: "true"
+      GATEWAY_CACHE_ENABLED: "true"
+      GATEWAY_QDRANT_URL: http://qdrant:6333
+      GATEWAY_QDRANT_API_KEY: &qdrant_key ${QDRANT_API_KEY:-local-dev-qdrant-key}
+      GATEWAY_CACHE_EMBEDDING_MODEL: &embedding_model nomic-embed-text
+      GATEWAY_CACHE_EMBEDDING_DIMS: "768"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       migrate:
@@ -19,6 +24,8 @@ services:
         condition: service_completed_successfully
       jaeger:
         condition: service_started
+      qdrant:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 5s
@@ -27,20 +34,37 @@ services:
   ollama:
     image: ollama/ollama:0.40.12
     volumes: ["ollama:/root/.ollama"]
+    environment:
+      # Keep models loaded between requests: a reload takes longer than the semantic
+      # cache waits for an embedding, so every lookup after an idle spell would bypass it.
+      OLLAMA_KEEP_ALIVE: 24h
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 5s
       retries: 20
 
-  # One-shot: pulls the demo model into the shared volume, then exits.
+  # One-shot: pulls the demo chat model and the embedding model (for the semantic cache)
+  # into the shared volume, then exits.
   ollama-pull:
     image: ollama/ollama:0.40.12
     environment:
       OLLAMA_HOST: ollama:11434
-    entrypoint: ["ollama", "pull", "${DEMO_MODEL:-qwen2.5:0.5b}"]
+      CHAT_MODEL: ${DEMO_MODEL:-qwen2.5:0.5b}
+      EMBEDDING_MODEL: *embedding_model
+    entrypoint: ["sh", "-c", "ollama pull \"$$CHAT_MODEL\" && ollama pull \"$$EMBEDDING_MODEL\""]
     depends_on:
       ollama:
         condition: service_healthy
+
+  # Semantic cache. Losing it only costs cache misses, so no volume. Every tenant's cached
+  # answers live here, so it takes an API key, and a memory cap: a full Qdrant crashes and
+  # the gateway goes on uncached, instead of the host running out of memory.
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    environment:
+      QDRANT__SERVICE__API_KEY: *qdrant_key
+    mem_limit: 1g
+    ports: ["127.0.0.1:6333:6333"]
 
   jaeger:
     image: jaegertracing/jaeger:2.21.0

@@ -27,6 +27,9 @@ class ChatCompletionBody(BaseModel):
     stream_options: StreamOptions | None = None
     max_tokens: int | None = Field(default=None, gt=0, le=MAX_COMPLETION_TOKENS)
     temperature: float | None = Field(default=None, ge=0, le=2)
+    # Not forwarded yet; only noted, so such requests never use the semantic cache.
+    tools: list[Any] | None = None
+    functions: list[Any] | None = None
 
     @field_validator("model")
     @classmethod
@@ -49,4 +52,5 @@ class ChatCompletionBody(BaseModel):
             messages=tuple(self.messages),
             max_tokens=self.max_tokens,
             temperature=self.temperature,
+            has_tools=bool(self.tools or self.functions),
         )
