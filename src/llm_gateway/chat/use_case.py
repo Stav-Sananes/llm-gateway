@@ -5,10 +5,12 @@ error. Tokens are reserved for the worst case up front and settled against the
 provider's reported usage when the stream ends, however it ends; then one usage event
 records what happened.
 
-Between the budget and the provider sits the semantic cache: a hit is replayed for free,
-and a miss's answer is remembered once it has finished cleanly.
+Before the budget sits the semantic cache: a hit is replayed for free, and a miss's answer
+is remembered once it has finished cleanly. When the router resumes an answer on another
+provider mid-stream, each provider gets its own usage event and the switch is recorded.
 """
 
+import itertools
 import logging
 import time
 import uuid
@@ -27,8 +29,8 @@ from llm_gateway.cache.model import (
 )
 from llm_gateway.cache.semantic import Hit, Lookup, Miss, SemanticCache, replay
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, Origin, Usage
-from llm_gateway.chat.ports import ChatProvider, ChunkStream
-from llm_gateway.limits.estimate import estimate_prompt_tokens
+from llm_gateway.chat.ports import ChatProvider, ChunkStream, NoSwitchRecording, ProviderSwitches
+from llm_gateway.limits.estimate import estimate_prompt_tokens, estimate_text_tokens
 from llm_gateway.limits.ports import (
     BudgetUnavailableError,
     RateLimiter,
@@ -45,6 +47,7 @@ logger = logging.getLogger(__name__)
 # has gone and the request is being cancelled.
 FINISH_TIMEOUT_S = 5.0
 NO_USAGE_RECORDING = NoUsageRecording()
+NO_SWITCH_RECORDING = NoSwitchRecording()
 
 
 class ChatCompletions:
@@ -58,6 +61,7 @@ class ChatCompletions:
         clock: Callable[[], float] = time.monotonic,
         finish_timeout_s: float = FINISH_TIMEOUT_S,
         cache: SemanticCache | None = None,
+        switches: ProviderSwitches = NO_SWITCH_RECORDING,
     ) -> None:
         self._provider = provider
         self._rate_limiter = rate_limiter
@@ -67,6 +71,7 @@ class ChatCompletions:
         self._clock = clock
         self._finish_timeout_s = finish_timeout_s
         self._cache = cache
+        self._switches = switches
 
     async def start(
         self,
@@ -76,7 +81,14 @@ class ChatCompletions:
     ) -> ChunkStream:
         """Raises RateLimitedError, BudgetExhaustedError or BudgetUnavailableError up front."""
         await self._rate_limiter.acquire(tenant.id)
-        meter = _Meter(tenant.id, request.model, datetime.now(UTC), self._clock(), self._clock)
+        meter = _Meter(
+            tenant.id,
+            request.model,
+            estimate_prompt_tokens(request.messages),
+            datetime.now(UTC),
+            self._clock(),
+            self._clock,
+        )
         # Before the reservation: a hit costs nothing, and a lookup that fails or is
         # cancelled can't leave a reservation behind. It keys on the request as the client
         # sent it, max_tokens included.
@@ -85,7 +97,7 @@ class ChatCompletions:
             return self._metered(replay(lookup), None, meter, lookup)
         # Cap the completion upstream too, so the reservation really is the worst case.
         max_tokens = request.max_tokens or self._default_max_tokens
-        worst_case = estimate_prompt_tokens(request.messages) + max_tokens
+        worst_case = meter.prompt_estimate + max_tokens
         reservation = await self._budget.reserve(tenant.id, worst_case)
         chunks = self._provider.stream(replace(request, max_tokens=max_tokens))
         return self._metered(chunks, reservation, meter, lookup)
@@ -116,12 +128,17 @@ class ChatCompletions:
             # tenant would stay charged the worst case.
             with anyio.move_on_after(self._finish_timeout_s, shield=True) as finishing:
                 await chunks.aclose()
-                charged = _tokens_used(reservation, meter.started, meter.usage)
+                events = meter.events(reservation)
                 if reservation is not None:  # a cache hit reserved nothing
-                    await self._settle(reservation, charged)
-                await self._usage.record(meter.event(charged))
-                if isinstance(lookup, Miss) and meter.usage is not None and meter.origin:
-                    self._remember(lookup, answer.finished(meter.origin.model))
+                    await self._settle(reservation, sum(e.charged_tokens for e in events))
+                for event in events:
+                    await self._usage.record(event)
+                for dead, resumed in meter.switches():
+                    await self._switches.record(
+                        meter.tenant_id, meter.requested_model, dead, resumed
+                    )
+                if isinstance(lookup, Miss) and (model := meter.answered_by()):
+                    self._remember(lookup, answer.finished(model))
             if finishing.cancelled_caught:
                 logger.error(
                     "request finish took over %ss; settle or usage lost", self._finish_timeout_s
@@ -165,60 +182,86 @@ class _AnswerText:
 
 
 @dataclass
+class _Segment:
+    """What one provider streamed of the answer."""
+
+    origin: Origin | None
+    first_chunk_clock: float
+    completion_estimate: int = 0  # from the text, for a provider that died before reporting
+    usage: Usage | None = None
+
+
+@dataclass
 class _Meter:
-    """What one request's stream did, as it happens."""
+    """What one request's stream did, as it happens. A new Origin mid-stream means another
+    provider took over the answer: a new segment, and its own usage event."""
 
     tenant_id: UUID
     requested_model: str
+    prompt_estimate: int
     started_at: datetime
     started_clock: float
     clock: Callable[[], float]
-    origin: Origin | None = None
-    usage: Usage | None = None
-    first_chunk_clock: float | None = None
-
-    @property
-    def started(self) -> bool:
-        return self.first_chunk_clock is not None
+    segments: list[_Segment] = field(default_factory=list)
 
     def saw(self, chunk: CompletionChunk) -> None:
-        if self.first_chunk_clock is None:
-            self.first_chunk_clock = self.clock()
-        self.origin = chunk.origin or self.origin
-        self.usage = chunk.usage or self.usage
+        if not self.segments or chunk.origin is not None:
+            self.segments.append(_Segment(chunk.origin, self.clock()))
+        segment = self.segments[-1]
+        segment.completion_estimate += estimate_text_tokens(chunk.content)
+        segment.usage = chunk.usage or segment.usage
 
-    def event(self, charged: int) -> UsageEvent:
-        usage = self.usage or Usage(0, 0)
+    def answered_by(self) -> str | None:
+        """The model, when one provider answered the whole request and reported usage."""
+        if len(self.segments) != 1:
+            return None
+        (segment,) = self.segments
+        if segment.usage is None or segment.origin is None:
+            return None
+        return segment.origin.model
+
+    def switches(self) -> list[tuple[Origin, Origin]]:
+        origins = [s.origin for s in self.segments if s.origin is not None]
+        return list(itertools.pairwise(origins))
+
+    def events(self, reservation: Reservation | None) -> list[UsageEvent]:
+        """One event per provider that served the request (one with no provider if none did).
+
+        Charges: a reported usage as reported; a provider that died and was continued, the
+        estimate of its prompt and its output; an answer that ended without any usage
+        report, the rest of the reservation (the worst case, as nothing better is known)."""
+        if not self.segments:
+            return [self._event(None, Outcome.FAILED, Usage(0, 0), 0)]
+        events: list[UsageEvent] = []
+        *continued, last = self.segments
+        for segment in continued:
+            usage = Usage(self.prompt_estimate, segment.completion_estimate)
+            events.append(self._event(segment, Outcome.RESUMED, usage, usage.total_tokens))
+        if last.usage is not None:
+            events.append(self._event(last, Outcome.COMPLETED, last.usage, last.usage.total_tokens))
+        else:
+            so_far = sum(e.charged_tokens for e in events)
+            rest = max(0, reservation.tokens - so_far) if reservation is not None else 0
+            events.append(self._event(last, Outcome.INTERRUPTED, Usage(0, 0), rest))
+        return events
+
+    def _event(
+        self, segment: _Segment | None, outcome: Outcome, usage: Usage, charged: int
+    ) -> UsageEvent:
+        origin = segment.origin if segment else None
         return UsageEvent(
             event_id=uuid.uuid4(),
             tenant_id=self.tenant_id,
             requested_model=self.requested_model,
-            provider=self.origin.provider if self.origin else None,
-            model=self.origin.model if self.origin else None,
-            outcome=self._outcome(),
+            provider=origin.provider if origin else None,
+            model=origin.model if origin else None,
+            outcome=outcome,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             charged_tokens=charged,
             started_at=self.started_at,
             duration_s=self.clock() - self.started_clock,
             time_to_first_chunk_s=(
-                None
-                if self.first_chunk_clock is None
-                else self.first_chunk_clock - self.started_clock
+                segment.first_chunk_clock - self.started_clock if segment else None
             ),
         )
-
-    def _outcome(self) -> Outcome:
-        if self.usage is not None:
-            return Outcome.COMPLETED
-        return Outcome.INTERRUPTED if self.started else Outcome.FAILED
-
-
-def _tokens_used(reservation: Reservation | None, started: bool, usage: Usage | None) -> int:
-    if usage is not None:
-        return usage.total_tokens
-    if reservation is None:
-        return 0
-    # Nothing came back (provider refused or was down): nothing to charge.
-    # Output came back but no usage report (the stream broke): charge the upper bound.
-    return reservation.tokens if started else 0

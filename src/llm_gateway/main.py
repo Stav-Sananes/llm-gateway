@@ -19,10 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from llm_gateway import telemetry
 from llm_gateway.audit.log import AuditLog
+from llm_gateway.audit.switches import AuditedSwitches
 from llm_gateway.authz.cedar_engine import CedarPolicyEngine, load_policies
 from llm_gateway.cache.semantic import CacheBreakers, CacheSettings, SemanticCache
-from llm_gateway.chat.ports import ChatProvider
-from llm_gateway.chat.use_case import ChatCompletions
+from llm_gateway.chat.ports import ChatProvider, ProviderSwitches
+from llm_gateway.chat.use_case import NO_SWITCH_RECORDING, ChatCompletions
 from llm_gateway.config import Settings
 from llm_gateway.http.app import create_app
 from llm_gateway.http.mcp_endpoint import build_mcp_app, build_mcp_server
@@ -187,6 +188,7 @@ def build_chat(
     redis: Redis,
     usage: UsageRecorder,
     cache: SemanticCache | None = None,
+    switches: ProviderSwitches = NO_SWITCH_RECORDING,
 ) -> ChatCompletions:
     burst, per_s = settings.rate_limit_burst, settings.rate_limit_per_s
     rate_limiter = FailOpenRateLimiter(
@@ -198,7 +200,13 @@ def build_chat(
         else RedisTokenBudget(redis, settings.token_budget_per_day)
     )
     return ChatCompletions(
-        provider, rate_limiter, budget, settings.default_max_tokens, usage, cache=cache
+        provider,
+        rate_limiter,
+        budget,
+        settings.default_max_tokens,
+        usage,
+        cache=cache,
+        switches=switches,
     )
 
 
@@ -215,10 +223,11 @@ def build_app(settings: Settings) -> FastAPI:
 
     # Loaded now, so a broken policy file stops the gateway from starting.
     policy = CedarPolicyEngine(load_policies(settings.policy_file))
+    audit = AuditLog(PostgresAuditStore(engine))
     tools = ToolGateway(
         HttpMcpUpstreams(settings.mcp_servers, settings.mcp_timeout_s),
         policy,
-        AuditLog(PostgresAuditStore(engine)),
+        audit,
         ToolLimits(settings.mcp_max_argument_bytes, settings.mcp_max_result_bytes),
     )
     mcp_app, mcp_sessions = build_mcp_app(build_mcp_server(tools), authenticator)
@@ -251,7 +260,7 @@ def build_app(settings: Settings) -> FastAPI:
     )
     cache, cache_clients = build_cache(settings, metrics)
     app = create_app(
-        build_chat(settings, router, redis, usage, cache),
+        build_chat(settings, router, redis, usage, cache, AuditedSwitches(audit)),
         authenticator,
         breakers,
         lifespan=lifespan,

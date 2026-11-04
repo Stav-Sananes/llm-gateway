@@ -166,3 +166,16 @@ async def test_a_hit_still_counts_against_the_rate_limit() -> None:
 
     with pytest.raises(RateLimitedError):
         await world.ask()  # would be a hit, but the tenant is out of requests
+
+
+async def test_an_answer_two_providers_stitched_together_is_not_kept() -> None:
+    resumed = (
+        CompletionChunk(content="Par", origin=Origin("claude", "opus")),
+        CompletionChunk(content="is.", origin=Origin("ollama", "llama3")),  # took over
+        CompletionChunk(finish_reason="stop"),
+        CompletionChunk(usage=Usage(9, 3)),
+    )
+    world = World(ScriptedProvider(resumed))
+
+    assert await world.ask() == "Paris."
+    assert world.store.points == []
