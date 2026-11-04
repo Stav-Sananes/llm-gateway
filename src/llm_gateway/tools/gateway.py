@@ -1,7 +1,10 @@
 """The MCP aggregator's use case: every tool call is decided, audited, then forwarded.
 
     check name and size ─► decide (Cedar) ─► audit "tool.call.decided"
-        ─► denied / needs approval → refusal
+        ─► denied → refusal
+        ─► needs approval → held until a human decides ─► audit "tool.call.approval"
+              ├► approved → upstream ─► audit the outcome
+              └► rejected / expired → refusal
         └► allowed → upstream ─► audit the outcome
 
 The decision is written to the audit chain *before* the call runs; if that write fails, the
@@ -18,6 +21,9 @@ from typing import Any
 
 import anyio
 
+from llm_gateway.approvals.hold import ApprovalHold
+from llm_gateway.approvals.model import ApprovalStatus
+from llm_gateway.approvals.ports import ApprovalUnavailableError, TooManyPendingError
 from llm_gateway.audit.chain import UnauditableEventError
 from llm_gateway.audit.log import AuditLog
 from llm_gateway.audit.ports import AuditUnavailableError
@@ -38,6 +44,7 @@ from llm_gateway.tools.ports import UpstreamServers
 logger = logging.getLogger(__name__)
 
 AUDIT_UNAVAILABLE = "The audit log is unavailable, so the call was not made."
+APPROVALS_UNAVAILABLE = "Approvals are unavailable, so the call was not made."
 _AUDIT_FAILURES = (AuditUnavailableError, UnauditableEventError)
 DEFAULT_LIMITS = ToolLimits()
 _AUDITED_NAME_CHARS = 200  # a rejected name is client input of any length
@@ -50,11 +57,13 @@ class ToolGateway:
         policy: PolicyEngine,
         audit: AuditLog,
         limits: ToolLimits = DEFAULT_LIMITS,
+        hold: ApprovalHold | None = None,  # None: calls needing approval are refused
     ) -> None:
         self._upstreams = upstreams
         self._policy = policy
         self._audit = audit
         self._limits = limits
+        self._hold = hold
 
     async def list_tools(self) -> Sequence[ToolSpec]:
         return await self._upstreams.list_tools()
@@ -95,11 +104,41 @@ class ToolGateway:
         if decision.decision is Decision.DENY:
             return ToolResult.error(f"Denied by policy: {', '.join(decision.reasons)}")
         if decision.decision is Decision.REQUIRE_APPROVAL:
-            # The approval hold (build step 9) will park the call here instead.
-            return ToolResult.error(
-                "This call needs a human's approval, which isn't available yet."
-            )
+            return await self._held(tenant, call, decision.reasons)
         return await self._forward(tenant, call)
+
+    async def _held(self, tenant: Tenant, call: ToolCall, reasons: Sequence[str]) -> ToolResult:
+        if self._hold is None:
+            return ToolResult.error("This call needs a human's approval, which isn't set up.")
+        try:
+            approval = await self._hold.wait(call, reasons)
+        except TooManyPendingError:
+            return ToolResult.error(
+                "Too many of this tenant's calls are already waiting for approval."
+            )
+        except ApprovalUnavailableError as error:
+            logger.error("tool call %s not made, approvals failed: %s", call.qualified_name, error)
+            return ToolResult.error(APPROVALS_UNAVAILABLE)
+        # On the chain before anything runs, like the policy decision.
+        await self._audit.record(
+            tenant.id,
+            "tool.call.approval",
+            {
+                "tool": call.qualified_name,
+                "approval_id": str(approval.id),
+                "status": approval.status.value,
+                "decided_by": approval.decided_by,
+                "note": approval.note,
+            },
+        )
+        if approval.status is ApprovalStatus.APPROVED:
+            return await self._forward(tenant, call)
+        if approval.status is ApprovalStatus.REJECTED:
+            why = f": {approval.note}" if approval.note else ""
+            return ToolResult.error(f"Rejected by {approval.decided_by}{why}")
+        return ToolResult.error(
+            f"Nobody approved this call within {self._hold.timeout_s:g} seconds."
+        )
 
     def _checked_call(
         self, tenant: Tenant, qualified_name: str, arguments: Mapping[str, Any]

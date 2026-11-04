@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from mcp.shared._httpx_utils import create_mcp_http_client
 
 from harness.fake_mcp import McpCallLog, create_fake_fs_server, create_fake_sql_server, slowed
 from llm_gateway.audit.log import AuditLog, Verification
+from llm_gateway.cli import main as cli
 from llm_gateway.config import Settings
 from llm_gateway.main import build_app, build_engine
 from llm_gateway.storage.audit_store import PostgresAuditStore
@@ -25,6 +27,8 @@ from tests.support.servers import serving
 CLIENT_TIMEOUT_S = 15  # a broken gateway deadline fails the test instead of hanging it
 MCP_HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 LIST_TOOLS = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+APPROVAL_TIMEOUT_S = 3.0
+MOVE = {"source": "/sandbox/a", "destination": "/sandbox/b"}
 
 
 @dataclass
@@ -43,7 +47,11 @@ def gateway(services: Settings) -> Iterator[Gateway]:
         serving(create_fake_fs_server(fs_log)) as fs_url,
     ):
         settings = services.model_copy(
-            update={"mcp_servers": {"sql": f"{sql_url}/mcp", "fs": f"{fs_url}/mcp"}}
+            update={
+                "mcp_servers": {"sql": f"{sql_url}/mcp", "fs": f"{fs_url}/mcp"},
+                "approval_timeout_s": APPROVAL_TIMEOUT_S,
+                "approval_poll_s": 0.05,
+            }
         )
         with serving(build_app(settings)) as url:
             yield Gateway(f"{url}/mcp", new_api_key(services), sql_log, fs_log)
@@ -129,12 +137,77 @@ def test_argument_level_rules_decide_the_same_tool_both_ways(gateway: Gateway) -
     assert gateway.fs.calls == [("write_file", {"path": "/sandbox/notes.txt", "content": "hi"})]
 
 
-def test_a_call_needing_approval_is_refused_until_approvals_exist(gateway: Gateway) -> None:
-    _, [result] = mcp(
-        gateway, ("fs__move_file", {"source": "/sandbox/a", "destination": "/sandbox/b"})
+def held_call(gateway: Gateway) -> tuple[threading.Thread, list[types.CallToolResult]]:
+    """Start a call the default policies hold for approval; it waits in its own thread."""
+    results: list[types.CallToolResult] = []
+    thread = threading.Thread(
+        target=lambda: results.extend(mcp(gateway, ("fs__move_file", MOVE))[1]), daemon=True
     )
+    thread.start()
+    return thread, results
 
-    assert result.is_error
+
+def approvals(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, str, str]:
+    exit_code = cli(["approvals", *args])
+    out, err = capsys.readouterr()
+    return exit_code, out.strip(), err.strip()
+
+
+def waiting_approval(capsys: pytest.CaptureFixture[str]) -> str:
+    """The id of the one held call, once `approvals list` shows it."""
+    deadline = time.monotonic() + APPROVAL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        _, listed, _ = approvals(capsys, "list")
+        if listed:
+            (line,) = listed.splitlines()
+            assert "fs__move_file" in line and "/sandbox/b" in line
+            return line.split()[0]
+        time.sleep(0.05)
+    raise AssertionError("no call was held")
+
+
+def test_a_held_call_runs_once_an_admin_approves_it(
+    gateway: Gateway, services: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    thread, results = held_call(gateway)
+    approval_id = waiting_approval(capsys)
+    assert gateway.fs.calls == []  # still waiting
+
+    code, out, _ = approvals(capsys, "approve", approval_id, "--by", "dana")
+    thread.join(timeout=CLIENT_TIMEOUT_S)
+
+    assert (code, out.split()[0]) == (0, "approved")
+    [result] = results
+    assert not result.is_error
+    assert gateway.fs.calls == [("move_file", MOVE)]
+    payloads, verification = audit_trail(services)
+    assert verification.ok
+    approval = next(p for p in payloads if p["action"] == "tool.call.approval")
+    assert approval["details"]["decided_by"] == "dana"
+
+
+def test_a_rejected_call_tells_the_client_why_and_never_runs(
+    gateway: Gateway, capsys: pytest.CaptureFixture[str]
+) -> None:
+    thread, results = held_call(gateway)
+    approval_id = waiting_approval(capsys)
+
+    approvals(capsys, "reject", approval_id, "--by", "dana", "--note", "not today")
+    thread.join(timeout=CLIENT_TIMEOUT_S)
+
+    [result] = results
+    assert result.is_error and text(result) == "Rejected by dana: not today"
+    assert gateway.fs.calls == []
+    code, _, err = approvals(capsys, "approve", approval_id, "--by", "dana")
+    assert code == 1 and "already rejected" in err
+
+
+def test_a_held_call_nobody_decides_expires_and_never_runs(gateway: Gateway) -> None:
+    started = time.monotonic()
+    _, [result] = mcp(gateway, ("fs__move_file", MOVE))
+
+    assert result.is_error and "Nobody approved" in text(result)
+    assert time.monotonic() - started >= APPROVAL_TIMEOUT_S
     assert gateway.fs.calls == []
 
 

@@ -27,5 +27,5 @@ async def empty_tables(engine: AsyncEngine) -> None:
     """Clean at the start of each test, so a failed test leaves evidence behind."""
     async with engine.begin() as connection:
         await connection.exec_driver_sql(
-            "TRUNCATE audit_events, audit_heads, api_keys, tenants, usage_events"
+            "TRUNCATE approvals, audit_events, audit_heads, api_keys, tenants, usage_events"
         )

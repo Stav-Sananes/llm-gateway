@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     # results over the second limit are withheld from the client.
     mcp_max_argument_bytes: int = Field(default=64 * 1024, gt=0)
     mcp_max_result_bytes: int = Field(default=1024 * 1024, gt=0)
+    # A call a policy holds for approval waits this long for a human (the MCP client's own
+    # request timeout must be longer); each tenant may have this many waiting at once.
+    approval_timeout_s: float = Field(default=120.0, gt=0, le=3600)
+    approval_poll_s: float = Field(default=0.5, gt=0)
+    approval_max_pending_per_tenant: int = Field(default=10, ge=0)
 
     # Semantic cache (Qdrant + an embedding model). Off unless enabled; when Qdrant or the
     # embedder is down, requests go on uncached.
