@@ -1,7 +1,8 @@
 """Fakes for the semantic cache's ports, behaving like the real adapters."""
 
 import math
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import anyio
@@ -112,8 +113,8 @@ class MalformedEmbedder:
         raise RuntimeError("unexpected")
 
 
-def breakers(threshold: int = 2) -> CacheBreakers:
+def breakers(threshold: int = 2, clock: Callable[[], float] = time.monotonic) -> CacheBreakers:
     return CacheBreakers(
-        embedder=CircuitBreaker("cache-embedder", threshold, reset_after_s=30),
-        store=CircuitBreaker("cache-store", threshold, reset_after_s=30),
+        embedder=CircuitBreaker("cache-embedder", threshold, reset_after_s=30, clock=clock),
+        store=CircuitBreaker("cache-store", threshold, reset_after_s=30, clock=clock),
     )

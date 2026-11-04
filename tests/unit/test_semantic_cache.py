@@ -33,6 +33,7 @@ from tests.support.cache import (
 pytestmark = pytest.mark.anyio
 
 ACME, GLOBEX = UUID(int=1), UUID(int=2)
+NO_DIRECTIVES = CacheDirectives()  # read and write
 ANSWER = CachedAnswer("Paris.", "stop", "llama3")
 
 
@@ -252,6 +253,45 @@ async def test_a_slow_embedder_is_given_up_on_at_the_timeout() -> None:
         assert await cache.look_up(ACME, asking(), CacheDirectives()) is None
 
 
+async def test_a_failing_embedder_opens_its_own_circuit() -> None:
+    embedder = BagOfWordsEmbedder(down=True)
+    cache = a_cache(embedder)
+
+    results = [await cache.look_up(ACME, asking(), NO_DIRECTIVES) for _ in range(4)]
+
+    assert results == [None] * 4
+    assert len(embedder.calls) == 2  # threshold 2: then the open circuit stops embedding
+
+
+async def test_the_cache_is_used_again_once_its_circuit_resets() -> None:
+    now = [0.0]
+    store = InMemoryAnswerStore(down=True)
+    cache = SemanticCache(
+        BagOfWordsEmbedder(),
+        store,
+        breakers(threshold=2, clock=lambda: now[0]),
+        CacheSettings(timeout_s=0.5),
+    )
+    for _ in range(2):
+        await cache.look_up(ACME, asking(), NO_DIRECTIVES)
+    store.down = False
+    assert await cache.look_up(ACME, asking(), NO_DIRECTIVES) is None  # still open
+
+    now[0] += 31  # past reset_after_s: the next call is the trial
+    await cached(cache, asking())
+
+    assert isinstance(await cache.look_up(ACME, asking(), NO_DIRECTIVES), Hit)
+
+
+async def test_embedding_and_search_share_one_deadline() -> None:
+    # Each fits in the timeout alone; together they don't.
+    cache = a_cache(
+        BagOfWordsEmbedder(delay_s=0.06), InMemoryAnswerStore(delay_s=0.06), timeout_s=0.1
+    )
+
+    assert await cache.look_up(ACME, asking(), NO_DIRECTIVES) is None
+
+
 async def test_warming_up_retries_a_cold_embedder_without_opening_its_circuit() -> None:
     embedder = ColdEmbedder(cold_calls=3)  # more failures than the breaker's threshold
     cache = a_cache(embedder)
@@ -304,6 +344,56 @@ async def test_a_question_differing_in_a_negation_is_not_a_hit_even_at_score_1()
     assert isinstance(lookup, Miss)
 
 
+async def test_a_question_differing_only_in_not_is_a_miss() -> None:
+    # 6 of 7 words shared and no word flipped: only the negation rule tells them apart.
+    cache = a_cache(SameVectorEmbedder())
+    await cached(cache, asking("Should I restart the primary server?"))
+
+    assert isinstance(
+        await cache.look_up(
+            ACME, asking("Should I not restart the primary server?"), NO_DIRECTIVES
+        ),
+        Miss,
+    )
+
+
+async def test_a_word_flipped_to_its_opposite_is_a_miss_even_when_most_words_match() -> None:
+    # 14 of 16 words shared: only the un-/in-/dis- rule tells them apart.
+    cache = a_cache(SameVectorEmbedder())
+    question = "Tell me whether the new payment service in the staging cluster is {} to handle load"
+    await cached(cache, asking(question.format("able")))
+
+    assert isinstance(
+        await cache.look_up(ACME, asking(question.format("unable")), NO_DIRECTIVES), Miss
+    )
+
+
+@pytest.mark.parametrize(
+    ("other", "hit"),
+    [
+        ("What is the capital of France, please?", True),  # 6 of 7 words: 0.86
+        ("What is the capital and largest city of France today?", False),  # 6 of 10: 0.6
+    ],
+)
+async def test_most_words_must_be_shared(other: str, hit: bool) -> None:
+    cache = a_cache(SameVectorEmbedder())
+    await cached(cache, asking("What is the capital of France?"))
+
+    lookup = await cache.look_up(ACME, asking(other), NO_DIRECTIVES)
+
+    assert isinstance(lookup, Hit) is hit
+
+
+async def test_the_nearest_answers_are_checked_until_one_agrees_word_for_word() -> None:
+    cache = a_cache(SameVectorEmbedder())  # all three score 1.0, the right one last
+    for question in ("How much is 2 plus 3?", "How much is 2 plus 4?", "How much is 2 plus 2?"):
+        await cached(cache, asking(question))
+
+    assert isinstance(
+        await cache.look_up(ACME, asking("How much is 2 plus 2?"), NO_DIRECTIVES), Hit
+    )
+
+
 async def test_a_question_differing_in_a_number_is_not_a_hit_even_at_score_1() -> None:
     cache = a_cache(SameVectorEmbedder())
     await cached(cache, asking("How much is 2 plus 2?"))
@@ -326,6 +416,17 @@ async def test_a_long_question_matches_only_word_for_word() -> None:
 
     assert isinstance(other, Miss)
     assert isinstance(same, Hit)
+
+
+async def test_a_long_question_differing_only_in_its_instruction_is_a_miss() -> None:
+    # 201 of 203 words shared: only matching long questions word for word tells them apart.
+    document = " ".join(f"clause{i}" for i in range(200)) + ". "
+    cache = a_cache(SameVectorEmbedder())
+    await cached(cache, asking(document + "Summarize it."))
+
+    assert isinstance(
+        await cache.look_up(ACME, asking(document + "Translate it."), NO_DIRECTIVES), Miss
+    )
 
 
 async def test_a_malformed_embedder_reply_is_a_bypass_not_an_error() -> None:

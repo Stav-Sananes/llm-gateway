@@ -10,6 +10,7 @@ from llm_gateway.cache.semantic import CACHE_PROVIDER, CacheSettings, SemanticCa
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, Origin, Usage, collect
 from llm_gateway.chat.ports import ProviderUnavailableError
 from llm_gateway.chat.use_case import ChatCompletions
+from llm_gateway.limits.ports import RateLimitedError
 from llm_gateway.limits.token_bucket import InMemoryRateLimiter
 from llm_gateway.tenancy.model import Tenant
 from llm_gateway.usage.model import Outcome
@@ -39,6 +40,7 @@ class World:
         store_down: bool = False,
         embedder: BagOfWordsEmbedder | None = None,
         timeout_s: float = 0.5,
+        requests_allowed: int = 100,
     ) -> None:
         self.provider = provider or ScriptedProvider(ANSWER)
         self.store = InMemoryAnswerStore(down=store_down)
@@ -52,7 +54,8 @@ class World:
         )
         self.chat = ChatCompletions(
             self.provider,
-            InMemoryRateLimiter(capacity=100, refill_per_s=100),
+            # Refills too slowly to matter within a test: requests_allowed is the limit.
+            InMemoryRateLimiter(capacity=requests_allowed, refill_per_s=0.001),
             self.budget,
             100,
             self.usage,
@@ -139,9 +142,7 @@ class NeverReturnsEmbedder(BagOfWordsEmbedder):
 
 
 async def test_a_request_cancelled_during_the_lookup_leaves_no_reservation() -> None:
-    world = World()
-    world.cache._embedder = NeverReturnsEmbedder()
-    world.cache._settings = CacheSettings(timeout_s=60)
+    world = World(embedder=NeverReturnsEmbedder(), timeout_s=60)
 
     with anyio.move_on_after(0.05):
         await world.chat.start(QUESTION, ACME, CacheDirectives())
@@ -152,6 +153,16 @@ async def test_a_request_cancelled_during_the_lookup_leaves_no_reservation() -> 
 async def test_a_hit_is_served_even_when_the_budget_is_spent() -> None:
     world = World()
     await world.ask()
-    world.budget._limit = 0
+    await world.budget.reserve(ACME.id, 10_000 - world.budget.used(ACME.id))  # spend the rest
 
     assert await world.ask() == "Paris."
+
+
+async def test_a_hit_still_counts_against_the_rate_limit() -> None:
+    world = World(requests_allowed=2)
+    await world.ask()  # a miss
+    assert await world.ask() == "Paris."  # a hit
+    assert len(world.provider.requests) == 1
+
+    with pytest.raises(RateLimitedError):
+        await world.ask()  # would be a hit, but the tenant is out of requests

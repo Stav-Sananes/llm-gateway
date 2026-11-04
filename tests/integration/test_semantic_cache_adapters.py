@@ -2,6 +2,7 @@
 
 import time
 from collections.abc import AsyncIterator, Iterator
+from typing import Any, cast
 from uuid import UUID
 
 import anyio
@@ -53,10 +54,10 @@ async def stored(
 
 
 async def nearest(
-    store: QdrantAnswerStore, key: CacheKey, min_score: float = 0.95
+    store: QdrantAnswerStore, key: CacheKey, min_score: float = 0.95, now: float = NOW
 ) -> Neighbour | None:
     for _ in range(50):  # wait=False writes become searchable within milliseconds
-        found = await store.nearest(key, vector(key.question), min_score, NOW, limit=3)
+        found = await store.nearest(key, vector(key.question), min_score, now, limit=3)
         if found:
             return found[0]
         await anyio.sleep(0.02)
@@ -91,15 +92,19 @@ async def test_a_question_below_the_threshold_is_not_an_answer(qdrant: AsyncQdra
 async def test_an_expired_answer_is_not_returned_and_is_swept(qdrant: AsyncQdrantClient) -> None:
     store = await stored(qdrant, KEY, expires_at=NOW - 1)
     sweeper = QdrantAnswerStore(qdrant, DIMS, sweep_every=1, clock=lambda: NOW)
+    assert await nearest(store, KEY, now=NOW - 2) is not None  # stored: visible before expiry
 
     assert await store.nearest(KEY, vector(KEY.question), 0.95, NOW, limit=3) == []
-    await sweeper.put(CacheKey(ACME, "ctx-9", "fresh"), vector("fresh"), ANSWER, NOW + 60)
+    fresh = CacheKey(ACME, "ctx-9", "fresh")
+    await sweeper.put(fresh, vector(fresh.question), ANSWER, NOW + 60)
     for _ in range(50):
         if (await qdrant.count(COLLECTION, exact=True)).count == 1:
             break
         await anyio.sleep(0.02)
 
-    assert (await qdrant.count(COLLECTION, exact=True)).count == 1  # only the fresh one
+    assert (await qdrant.count(COLLECTION, exact=True)).count == 1
+    assert await nearest(sweeper, fresh) is not None  # the sweep kept the fresh one
+    assert await nearest(store, KEY, now=NOW - 2) is None  # and removed the expired one
 
 
 async def test_a_collection_built_for_another_embedding_size_is_reported(
@@ -200,3 +205,33 @@ async def test_another_replica_creating_the_collection_first_is_fine(
     async with anyio.create_task_group() as tasks:
         for store in (first, second, QdrantAnswerStore(qdrant, DIMS)):
             tasks.start_soon(store.nearest, KEY, vector(KEY.question), 0.95, NOW, 3)
+
+
+class LateToCreate:
+    """A client that, like a replica racing another, saw no collection that now exists."""
+
+    def __init__(self, client: AsyncQdrantClient) -> None:
+        self._client = client
+
+    async def collection_exists(self, name: str) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+@pytest.mark.parametrize(("existing_dims", "fine"), [(DIMS, True), (8, False)])
+async def test_losing_the_race_to_create_the_collection_checks_the_winners_size(
+    qdrant: AsyncQdrantClient, existing_dims: int, fine: bool
+) -> None:
+    await qdrant.create_collection(
+        COLLECTION,
+        vectors_config=models.VectorParams(size=existing_dims, distance=models.Distance.COSINE),
+    )
+    store = QdrantAnswerStore(cast(AsyncQdrantClient, LateToCreate(qdrant)), DIMS)
+
+    if fine:
+        assert await store.nearest(KEY, vector(KEY.question), 0.95, NOW, limit=3) == []
+    else:
+        with pytest.raises(AnswerStoreUnavailableError, match="8-dimension"):
+            await store.nearest(KEY, vector(KEY.question), 0.95, NOW, limit=3)

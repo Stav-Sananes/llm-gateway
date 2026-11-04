@@ -67,7 +67,7 @@ Compose stack, Ollama `qwen2.5:0.5b` for chat and `nomic-embed-text` for embeddi
 | Questions, in order | Result |
 |---|---|
 | "Is it safe to delete the users table?" then "Is it **un**safe …" | miss: the guard rejects the flip |
-| "is it safe to delete the users table?" after "Is it safe …" (case only) | hit, score 0.99999 |
+| "is it safe to delete the users table?" after "Is it safe …" (case only) | hit, score 0.99999: 0.03 s, against 0.6–1.5 s for a miss |
 | A 2,000-character document + "Summarize it", then the same document + "Translate it to French" | miss: long questions match word for word |
 | Any answer cut off by `max_tokens` (`finish_reason: length`) | never stored |
 
