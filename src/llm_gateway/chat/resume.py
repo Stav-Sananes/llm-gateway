@@ -24,8 +24,10 @@ MAX_OVERLAP_CHARS = 2000  # how far back a repeat is looked for, and held at mos
 def continuation(request: ChatRequest, partial: str) -> ChatRequest | None:
     """The request that asks for the rest of `partial`. None when the answer has already
     used its whole max_tokens, so there is nothing left to ask for."""
-    if not partial:
-        return request  # nothing was said yet: just ask again
+    if not partial.strip():
+        # Nothing was said yet (or only whitespace, which some APIs refuse as an assistant
+        # turn): just ask again.
+        return request
     max_tokens = request.max_tokens
     if max_tokens is not None:
         max_tokens -= estimate_text_tokens(partial)  # an over-estimate: never past the cap

@@ -224,6 +224,7 @@ def build_app(settings: Settings) -> FastAPI:
     # Loaded now, so a broken policy file stops the gateway from starting.
     policy = CedarPolicyEngine(load_policies(settings.policy_file))
     audit = AuditLog(PostgresAuditStore(engine))
+    switches = AuditedSwitches(audit)
     tools = ToolGateway(
         HttpMcpUpstreams(settings.mcp_servers, settings.mcp_timeout_s),
         policy,
@@ -235,6 +236,7 @@ def build_app(settings: Settings) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         async with mcp_sessions.run(), anyio.create_task_group() as background:
+            background.start_soon(switches.run)  # audits provider switches off the response path
             if cache is not None:
                 background.start_soon(cache.warm_up)  # load the embedding model before traffic
                 background.start_soon(cache.run_writer)  # stores answers off the response path
@@ -260,7 +262,7 @@ def build_app(settings: Settings) -> FastAPI:
     )
     cache, cache_clients = build_cache(settings, metrics)
     app = create_app(
-        build_chat(settings, router, redis, usage, cache, AuditedSwitches(audit)),
+        build_chat(settings, router, redis, usage, cache, switches),
         authenticator,
         breakers,
         lifespan=lifespan,

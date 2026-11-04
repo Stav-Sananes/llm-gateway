@@ -17,7 +17,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from llm_gateway.cache.semantic import LookupResult
 from llm_gateway.routing.breaker import BreakerState, CircuitBreaker
-from llm_gateway.usage.model import UsageEvent
+from llm_gateway.usage.model import Outcome, UsageEvent
 from llm_gateway.usage.ports import UsageRecorder
 from llm_gateway.usage.worker import Drained
 
@@ -51,6 +51,12 @@ class GatewayMetrics:
             "gateway_chat_requests",
             "Chat requests by outcome",
             ["provider", "outcome"],
+            registry=registry,
+        )
+        self.chat_resumes = Counter(
+            "gateway_chat_resumes",
+            "Answers a provider began, died during, and another provider continued",
+            ["provider"],
             registry=registry,
         )
         self.chat_tokens = Counter(
@@ -103,9 +109,13 @@ class GatewayMetrics:
 
     def observe_usage(self, event: UsageEvent) -> None:
         provider = event.provider or NO_PROVIDER
-        self.chat_requests.labels(provider, event.outcome.value).inc()
         self.chat_tokens.labels(provider, "prompt").inc(event.prompt_tokens)
         self.chat_tokens.labels(provider, "completion").inc(event.completion_tokens)
+        if event.outcome is Outcome.RESUMED:
+            # Another event follows for the same request: count the request once, there.
+            self.chat_resumes.labels(provider).inc()
+            return
+        self.chat_requests.labels(provider, event.outcome.value).inc()
         self.chat_duration.labels(provider).observe(event.duration_s)
         if event.time_to_first_chunk_s is not None:
             self.time_to_first_chunk.labels(provider).observe(event.time_to_first_chunk_s)

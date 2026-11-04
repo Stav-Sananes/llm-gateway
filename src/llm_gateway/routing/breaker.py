@@ -86,7 +86,9 @@ class CircuitBreaker:
 
 
 class GuardedProvider:
-    """A provider behind a circuit breaker. The provider counts as healthy once it streams."""
+    """A provider behind a circuit breaker. A call counts as a success only once its stream
+    has ended cleanly: a provider that keeps dying mid-answer must open its circuit, even
+    though resume (chat/resume.py) hides each death from the client."""
 
     def __init__(self, provider: ChatProvider, breaker: CircuitBreaker) -> None:
         self._provider = provider
@@ -97,17 +99,17 @@ class GuardedProvider:
         if permit is None:
             raise ProviderUnavailableError(f"{self.breaker.name} circuit is open")
         chunks = self._provider.stream(request)
-        answered = False
+        outcome_recorded = False
         try:
             async for chunk in chunks:
-                if not answered:
-                    answered = True
-                    self.breaker.record_success()
                 yield chunk
+            self.breaker.record_success()
+            outcome_recorded = True
         except ProviderUnavailableError:
             self.breaker.record_failure()
+            outcome_recorded = True
             raise
         finally:
             await chunks.aclose()
-            if not answered:
+            if not outcome_recorded:  # rejected, or the client left: says nothing either way
                 self.breaker.release(permit)

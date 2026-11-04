@@ -228,15 +228,18 @@ class _Meter:
         """One event per provider that served the request (one with no provider if none did).
 
         Charges: a reported usage as reported; a provider that died and was continued, the
-        estimate of its prompt and its output; an answer that ended without any usage
-        report, the rest of the reservation (the worst case, as nothing better is known)."""
+        estimate of its prompt (with the answer it was asked to continue) and its output;
+        an answer that ended without any usage report, the rest of the reservation (the
+        worst case, as nothing better is known)."""
         if not self.segments:
             return [self._event(None, Outcome.FAILED, Usage(0, 0), 0)]
         events: list[UsageEvent] = []
         *continued, last = self.segments
+        carried = 0  # each continuation's prompt also carries the answer so far
         for segment in continued:
-            usage = Usage(self.prompt_estimate, segment.completion_estimate)
+            usage = Usage(self.prompt_estimate + carried, segment.completion_estimate)
             events.append(self._event(segment, Outcome.RESUMED, usage, usage.total_tokens))
+            carried += segment.completion_estimate
         if last.usage is not None:
             events.append(self._event(last, Outcome.COMPLETED, last.usage, last.usage.total_tokens))
         else:

@@ -3,7 +3,9 @@
 Before the first chunk (connect error, timeout, 5xx, 429, open circuit) the next target
 simply gets the request. After it, a target that dies mid-answer is resumed: the next
 target is asked to continue the partial answer (see chat/resume.py), and the client sees
-one stream. The first chunk each target serves carries its Origin, so the switch is
+one stream. A target that refuses the continuation (4xx) is skipped like a dead one; when
+no target is left, the stream ends with ProviderUnavailableError, which the client gets
+in-band. The first chunk each target serves carries its Origin, so the switch is
 visible inside the gateway (usage rows, audit, the resume span) and nowhere else.
 """
 
@@ -15,7 +17,12 @@ from opentelemetry import trace
 from opentelemetry.trace import Tracer
 
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, Origin
-from llm_gateway.chat.ports import ChatProvider, ChunkStream, ProviderUnavailableError
+from llm_gateway.chat.ports import (
+    ChatProvider,
+    ChunkStream,
+    ProviderRejectedError,
+    ProviderUnavailableError,
+)
 from llm_gateway.chat.resume import Seam, continuation
 
 logger = logging.getLogger(__name__)
@@ -64,6 +71,14 @@ class Router:
             except (StopAsyncIteration, ProviderUnavailableError) as error:
                 await chunks.aclose()
                 failures.append(self._unavailable(target, str(error) or "empty stream"))
+                continue
+            except ProviderRejectedError as error:
+                await chunks.aclose()
+                if previous is None:  # the client's own request: wrong everywhere
+                    raise
+                # Only the continuation was refused (say, the partial answer pushed it past
+                # this model's context): another target may still take it.
+                failures.append(self._unavailable(target, f"refused to continue: {error}"))
                 continue
             origin = Origin(target.provider, target.model)
             if previous is not None:

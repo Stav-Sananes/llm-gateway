@@ -225,3 +225,58 @@ async def test_closing_the_stream_during_a_continuation_releases_the_continuing_
     await stream.aclose()
 
     assert a.closed and b.closed
+
+
+def three(a: ScriptedProvider, b: ScriptedProvider, c: ScriptedProvider) -> Router:
+    targets = [Target("a", "a-large"), Target("b", "b-small"), Target("c", "c-tiny")]
+    return Router({"a": a, "b": b, "c": c}, {"smart": targets}, default_provider="a")
+
+
+async def test_an_answer_can_change_hands_twice() -> None:
+    a = ScriptedProvider(text("The capital"), fail_after=True)
+    b = ScriptedProvider(text(" of France"), fail_after=True)
+    c = ScriptedProvider(text(" is Paris.") + FINISHED)
+    capped = ChatRequest("smart", ({"role": "user", "content": "hi"},), max_tokens=100)
+
+    completion = await collect(three(a, b, c).stream(capped))
+
+    assert completion.content == "The capital of France is Paris."
+    (asked,) = c.requests
+    assert asked.messages[-2] == {"role": "assistant", "content": "The capital of France"}
+    assert asked.max_tokens == 100 - 7  # 21 bytes of answer so far, about 7 tokens
+
+
+async def test_a_target_that_refuses_the_continuation_is_skipped_like_a_dead_one() -> None:
+    a = ScriptedProvider(text("The capital"), fail_after=True)
+    b = ScriptedProvider(text("unused"), rejects=True)  # e.g. past its context window
+    c = ScriptedProvider(text(" of France."))
+
+    completion = await collect(three(a, b, c).stream(a_request("smart")))
+
+    assert completion.content == "The capital of France."
+
+
+async def test_with_every_target_refusing_the_continuation_the_answer_breaks() -> None:
+    a = ScriptedProvider(text("The capital"), fail_after=True)
+    b = ScriptedProvider(text("unused"), rejects=True)
+
+    with pytest.raises(ProviderUnavailableError, match="b: refused to continue"):
+        await collect(router(a, b).stream(a_request("smart")))
+
+
+async def test_text_held_at_the_seam_is_released_when_the_continuation_just_ends() -> None:
+    a = ScriptedProvider(text("The capital of France"), fail_after=True)
+    b = ScriptedProvider(text("of Fra"))  # could still be a repeat; then the stream ends
+
+    completion = await collect(router(a, b).stream(a_request("smart")))
+
+    assert completion.content == "The capital of Franceof Fra"
+
+
+async def test_an_answer_of_only_whitespace_is_asked_for_again_from_the_start() -> None:
+    a = ScriptedProvider(text("\n"), fail_after=True)
+    b = ScriptedProvider(text("Paris."))
+
+    await collect(router(a, b).stream(a_request("smart")))
+
+    assert b.requests[0].messages == a_request("smart").messages

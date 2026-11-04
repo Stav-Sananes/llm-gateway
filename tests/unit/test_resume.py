@@ -29,12 +29,6 @@ def test_with_nothing_said_yet_the_request_is_asked_again_unchanged() -> None:
     assert continuation(QUESTION, "") == QUESTION
 
 
-def test_what_was_already_said_comes_off_max_tokens() -> None:
-    asked = continuation(ChatRequest("m", QUESTION.messages, max_tokens=100), "x" * 30)
-
-    assert asked is not None and asked.max_tokens == 90  # 30 bytes, about 10 tokens
-
-
 def test_an_answer_that_used_its_whole_max_tokens_has_nothing_left_to_ask_for() -> None:
     capped = ChatRequest("m", QUESTION.messages, max_tokens=10)
 
@@ -78,3 +72,23 @@ def test_text_held_back_is_released_with_the_finish_chunk() -> None:
 
 def test_nothing_is_held_after_a_partial_too_short_to_repeat() -> None:
     assert Seam("The").pass_on(CompletionChunk(content="The")).content == "The"
+
+
+def test_a_repeat_of_exactly_8_characters_is_dropped() -> None:
+    assert joined("I think France", "k France is big.") == " is big."  # "k France": 8
+
+
+def test_a_repeat_of_7_characters_is_kept() -> None:
+    assert joined("I think France", " France is big.") == " France is big."  # 7
+
+
+def test_a_restart_is_found_up_to_2000_characters_back() -> None:
+    partial = " ".join(f"word{i}" for i in range(300))[:1990]
+
+    assert joined(partial, partial + " and more.") == " and more."
+
+
+def test_a_restart_further_back_than_2000_characters_is_not_found() -> None:
+    partial = " ".join(f"word{i}" for i in range(400))[:2100]
+
+    assert joined(partial, partial + " and more.") == partial + " and more."
