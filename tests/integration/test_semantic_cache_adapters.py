@@ -56,9 +56,9 @@ async def nearest(
     store: QdrantAnswerStore, key: CacheKey, min_score: float = 0.95
 ) -> Neighbour | None:
     for _ in range(50):  # wait=False writes become searchable within milliseconds
-        found = await store.nearest(key, vector(key.question), min_score, NOW)
-        if found is not None:
-            return found
+        found = await store.nearest(key, vector(key.question), min_score, NOW, limit=3)
+        if found:
+            return found[0]
         await anyio.sleep(0.02)
     return None
 
@@ -69,22 +69,15 @@ async def test_a_stored_answer_is_found_by_a_reworded_question(qdrant: AsyncQdra
     found = await nearest(store, CacheKey(ACME, "ctx-1", "what is the capital of france"))
 
     assert found is not None and found.answer == ANSWER and found.score > 0.99
+    assert found.question == KEY.question  # for the word-for-word guard
 
 
 async def test_answers_never_cross_tenants_or_contexts(qdrant: AsyncQdrantClient) -> None:
     store = await stored(qdrant, KEY)
     assert await nearest(store, KEY) is not None  # positive control
 
-    assert (
-        await store.nearest(
-            CacheKey(GLOBEX, "ctx-1", KEY.question), vector(KEY.question), 0.95, NOW
-        )
-        is None
-    )
-    assert (
-        await store.nearest(CacheKey(ACME, "ctx-2", KEY.question), vector(KEY.question), 0.95, NOW)
-        is None
-    )
+    for other in (CacheKey(GLOBEX, "ctx-1", KEY.question), CacheKey(ACME, "ctx-2", KEY.question)):
+        assert await store.nearest(other, vector(KEY.question), 0.95, NOW, limit=3) == []
 
 
 async def test_a_question_below_the_threshold_is_not_an_answer(qdrant: AsyncQdrantClient) -> None:
@@ -92,14 +85,14 @@ async def test_a_question_below_the_threshold_is_not_an_answer(qdrant: AsyncQdra
     assert await nearest(store, KEY) is not None
 
     other = CacheKey(ACME, "ctx-1", "What is the capital of Germany?")
-    assert await store.nearest(other, vector(other.question), 0.95, NOW) is None
+    assert await store.nearest(other, vector(other.question), 0.95, NOW, limit=3) == []
 
 
 async def test_an_expired_answer_is_not_returned_and_is_swept(qdrant: AsyncQdrantClient) -> None:
     store = await stored(qdrant, KEY, expires_at=NOW - 1)
     sweeper = QdrantAnswerStore(qdrant, DIMS, sweep_every=1, clock=lambda: NOW)
 
-    assert await store.nearest(KEY, vector(KEY.question), 0.95, NOW) is None
+    assert await store.nearest(KEY, vector(KEY.question), 0.95, NOW, limit=3) == []
     await sweeper.put(CacheKey(ACME, "ctx-9", "fresh"), vector("fresh"), ANSWER, NOW + 60)
     for _ in range(50):
         if (await qdrant.count(COLLECTION, exact=True)).count == 1:
@@ -117,7 +110,7 @@ async def test_a_collection_built_for_another_embedding_size_is_reported(
     )
 
     with pytest.raises(AnswerStoreUnavailableError, match="8-dimension"):
-        await QdrantAnswerStore(qdrant, DIMS).nearest(KEY, vector(KEY.question), 0.95, NOW)
+        await QdrantAnswerStore(qdrant, DIMS).nearest(KEY, vector(KEY.question), 0.95, NOW, limit=3)
 
 
 async def test_qdrant_down_is_unavailable_quickly() -> None:
@@ -125,7 +118,9 @@ async def test_qdrant_down_is_unavailable_quickly() -> None:
     started = time.monotonic()
     try:
         with pytest.raises(AnswerStoreUnavailableError):
-            await QdrantAnswerStore(down, DIMS).nearest(KEY, vector(KEY.question), 0.95, NOW)
+            await QdrantAnswerStore(down, DIMS).nearest(
+                KEY, vector(KEY.question), 0.95, NOW, limit=3
+            )
     finally:
         await down.close()
 
@@ -159,3 +154,49 @@ async def test_an_embedder_error_or_outage_is_unavailable() -> None:
     async with httpx.AsyncClient(base_url=unused_local_url()) as client:
         with pytest.raises(EmbedderUnavailableError):
             await OpenAICompatibleEmbedder(client, "m", DIMS).embed("hi")
+
+
+async def test_the_same_question_stored_again_replaces_the_old_answer(
+    qdrant: AsyncQdrantClient,
+) -> None:
+    store = await stored(qdrant, *[KEY] * 20)
+    newer = CachedAnswer("Paris, France.", "stop", "llama3")
+    await store.put(KEY, vector(KEY.question), newer, NOW + 60)
+
+    for _ in range(50):
+        found = await nearest(store, KEY)
+        if found is not None and found.answer == newer:
+            break
+        await anyio.sleep(0.02)
+    assert (await qdrant.count(COLLECTION, exact=True)).count == 1
+    assert found is not None and found.answer == newer
+
+
+async def test_concurrent_first_lookups_dont_race_to_create_the_collection(
+    qdrant: AsyncQdrantClient,
+) -> None:
+    store = QdrantAnswerStore(qdrant, DIMS)
+    errors: list[Exception] = []
+
+    async def look() -> None:
+        try:
+            await store.nearest(KEY, vector(KEY.question), 0.95, NOW, limit=3)
+        except AnswerStoreUnavailableError as error:
+            errors.append(error)
+
+    async with anyio.create_task_group() as tasks:
+        for _ in range(8):
+            tasks.start_soon(look)
+
+    assert errors == []
+
+
+async def test_another_replica_creating_the_collection_first_is_fine(
+    qdrant: AsyncQdrantClient,
+) -> None:
+    # Two gateways, each with its own store object, both seeing "doesn't exist yet".
+    first, second = QdrantAnswerStore(qdrant, DIMS), QdrantAnswerStore(qdrant, DIMS)
+
+    async with anyio.create_task_group() as tasks:
+        for store in (first, second, QdrantAnswerStore(qdrant, DIMS)):
+            tasks.start_soon(store.nearest, KEY, vector(KEY.question), 0.95, NOW, 3)

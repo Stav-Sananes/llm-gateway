@@ -85,6 +85,11 @@ class GatewayMetrics:
             buckets=(0.9, 0.92, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995, 1.0),
             registry=registry,
         )
+        self.cache_writes_dropped = Counter(
+            "gateway_cache_writes_dropped",
+            "Answers not cached: the write queue was full",
+            registry=registry,
+        )
         self.cache_threshold = Gauge(
             "gateway_cache_similarity_threshold",
             "Minimum similarity for a cache hit",
@@ -226,3 +231,6 @@ class CacheMetrics:
         self._metrics.cache_lookups.labels(result.value).inc()
         if score is not None:
             self._metrics.cache_hit_score.observe(score)
+
+    def write_dropped(self) -> None:
+        self._metrics.cache_writes_dropped.inc()

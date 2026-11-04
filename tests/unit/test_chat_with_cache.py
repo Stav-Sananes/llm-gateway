@@ -2,6 +2,7 @@
 
 from uuid import UUID
 
+import anyio
 import pytest
 
 from llm_gateway.cache.model import CacheDirectives
@@ -10,10 +11,9 @@ from llm_gateway.chat.model import ChatRequest, CompletionChunk, Origin, Usage, 
 from llm_gateway.chat.ports import ProviderUnavailableError
 from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.limits.token_bucket import InMemoryRateLimiter
-from llm_gateway.routing.breaker import CircuitBreaker
 from llm_gateway.tenancy.model import Tenant
 from llm_gateway.usage.model import Outcome
-from tests.support.cache import BagOfWordsEmbedder, InMemoryAnswerStore
+from tests.support.cache import BagOfWordsEmbedder, InMemoryAnswerStore, breakers
 from tests.support.limits import InMemoryTokenBudget
 from tests.support.providers import ScriptedProvider
 from tests.support.usage import RecordedUsage
@@ -33,16 +33,22 @@ ANSWER = (
 
 
 class World:
-    def __init__(self, provider: ScriptedProvider | None = None, store_down: bool = False) -> None:
+    def __init__(
+        self,
+        provider: ScriptedProvider | None = None,
+        store_down: bool = False,
+        embedder: BagOfWordsEmbedder | None = None,
+        timeout_s: float = 0.5,
+    ) -> None:
         self.provider = provider or ScriptedProvider(ANSWER)
         self.store = InMemoryAnswerStore(down=store_down)
         self.budget = InMemoryTokenBudget(10_000)
         self.usage = RecordedUsage()
-        cache = SemanticCache(
-            BagOfWordsEmbedder(),
+        self.cache = SemanticCache(
+            embedder or BagOfWordsEmbedder(),
             self.store,
-            CircuitBreaker("semantic-cache", 5, 30),
-            CacheSettings(timeout_s=0.5),
+            breakers(threshold=5),
+            CacheSettings(timeout_s=timeout_s),
         )
         self.chat = ChatCompletions(
             self.provider,
@@ -50,14 +56,16 @@ class World:
             self.budget,
             100,
             self.usage,
-            cache=cache,
+            cache=self.cache,
         )
 
     async def ask(
         self, request: ChatRequest = QUESTION, directives: CacheDirectives | None = None
     ) -> str:
         chunks = await self.chat.start(request, ACME, directives or CacheDirectives())
-        return (await collect(chunks)).content
+        content = (await collect(chunks)).content
+        await self.cache.write_pending()  # what the app's background writer does
+        return content
 
 
 async def test_a_question_asked_again_is_answered_from_the_cache_for_free() -> None:
@@ -72,7 +80,8 @@ async def test_a_question_asked_again_is_answered_from_the_cache_for_free() -> N
 
     assert first == again == "Paris."
     assert len(world.provider.requests) == 1
-    assert world.budget.settled == [12, 0]  # the hit costs nothing
+    assert world.budget.settled == [12]  # the hit reserved and settled nothing
+    assert world.budget.used(ACME.id) == 12
     hit = world.usage.events[1]
     assert (hit.provider, hit.model, hit.outcome) == (CACHE_PROVIDER, "llama3", Outcome.COMPLETED)
 
@@ -121,3 +130,28 @@ async def test_an_ineligible_request_neither_reads_nor_fills_the_cache() -> None
 
     assert len(world.provider.requests) == 2
     assert world.store.points == []
+
+
+class NeverReturnsEmbedder(BagOfWordsEmbedder):
+    async def embed(self, text: str) -> list[float]:
+        await anyio.sleep_forever()
+        raise AssertionError
+
+
+async def test_a_request_cancelled_during_the_lookup_leaves_no_reservation() -> None:
+    world = World()
+    world.cache._embedder = NeverReturnsEmbedder()
+    world.cache._settings = CacheSettings(timeout_s=60)
+
+    with anyio.move_on_after(0.05):
+        await world.chat.start(QUESTION, ACME, CacheDirectives())
+
+    assert world.budget.used(ACME.id) == 0
+
+
+async def test_a_hit_is_served_even_when_the_budget_is_spent() -> None:
+    world = World()
+    await world.ask()
+    world.budget._limit = 0
+
+    assert await world.ask() == "Paris."

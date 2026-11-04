@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     # embedder is down, requests go on uncached.
     cache_enabled: bool = False
     qdrant_url: str = "http://localhost:6333"
+    qdrant_api_key: SecretStr | None = None
     # Embeddings come from an OpenAI-compatible /embeddings endpoint; unset uses upstream_base_url.
     cache_embedding_base_url: str | None = None
     cache_embedding_model: str = "nomic-embed-text"

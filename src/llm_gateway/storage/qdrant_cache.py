@@ -8,8 +8,9 @@ writes delete them.
 
 import time
 from collections.abc import Callable, Sequence
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid5
 
+import anyio
 import httpx
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
@@ -35,10 +36,11 @@ class QdrantAnswerStore:
         self._clock = clock
         self._writes = 0
         self._ready = False
+        self._ensuring = anyio.Lock()  # concurrent first lookups would race to create it
 
     async def nearest(
-        self, key: CacheKey, vector: Sequence[float], min_score: float, now: float
-    ) -> Neighbour | None:
+        self, key: CacheKey, vector: Sequence[float], min_score: float, now: float, limit: int
+    ) -> Sequence[Neighbour]:
         try:
             await self._ensure_collection()
             found = await self._client.query_points(
@@ -46,32 +48,24 @@ class QdrantAnswerStore:
                 query=list(vector),
                 query_filter=_same_question_space(key, now),
                 score_threshold=min_score,
-                limit=1,
+                limit=limit,
                 with_payload=True,
             )
         except _UNAVAILABLE as error:
             raise AnswerStoreUnavailableError(type(error).__name__) from error
-        if not found.points:
-            return None
-        point = found.points[0]
-        payload = point.payload or {}
-        try:
-            answer = CachedAnswer(
-                str(payload["content"]), str(payload["finish_reason"]), str(payload["model"])
-            )
-        except KeyError as error:
-            raise AnswerStoreUnavailableError(f"malformed point {point.id}") from error
-        return Neighbour(answer, float(point.score))
+        return [_neighbour(point) for point in found.points]
 
     async def put(
         self, key: CacheKey, vector: Sequence[float], answer: CachedAnswer, expires_at: float
     ) -> None:
         point = models.PointStruct(
-            id=str(uuid4()),
+            # The same question in the same context overwrites, so repeats don't pile up.
+            id=str(uuid5(NAMESPACE_URL, f"{key.tenant_id}|{key.context_hash}|{key.question}")),
             vector=list(vector),
             payload={
                 "tenant_id": str(key.tenant_id),
                 "context_hash": key.context_hash,
+                "question": key.question,
                 "content": answer.content,
                 "finish_reason": answer.finish_reason,
                 "model": answer.model,
@@ -99,22 +93,33 @@ class QdrantAnswerStore:
         """Created on first use, not at startup: the gateway must start without Qdrant."""
         if self._ready:
             return
-        if not await self._client.collection_exists(COLLECTION):
+        async with self._ensuring:
+            if self._ready:
+                return
+            if await self._client.collection_exists(COLLECTION):
+                await self._check_dimensions()
+            else:
+                await self._create_collection()
+            for field, schema in (
+                ("tenant_id", models.PayloadSchemaType.KEYWORD),
+                ("context_hash", models.PayloadSchemaType.KEYWORD),
+                ("expires_at", models.PayloadSchemaType.FLOAT),
+            ):
+                await self._client.create_payload_index(COLLECTION, field, field_schema=schema)
+            self._ready = True
+
+    async def _create_collection(self) -> None:
+        try:
             await self._client.create_collection(
                 COLLECTION,
                 vectors_config=models.VectorParams(
                     size=self._dimensions, distance=models.Distance.COSINE
                 ),
             )
-        else:
+        except UnexpectedResponse as error:
+            if error.status_code != 409:  # another replica created it first: fine
+                raise
             await self._check_dimensions()
-        for field, schema in (
-            ("tenant_id", models.PayloadSchemaType.KEYWORD),
-            ("context_hash", models.PayloadSchemaType.KEYWORD),
-            ("expires_at", models.PayloadSchemaType.FLOAT),
-        ):
-            await self._client.create_payload_index(COLLECTION, field, field_schema=schema)
-        self._ready = True
 
     async def _check_dimensions(self) -> None:
         # A collection left by another embedding model would fail every search.
@@ -124,6 +129,17 @@ class QdrantAnswerStore:
                 f"{COLLECTION} holds {size}-dimension vectors; the embedder makes "
                 f"{self._dimensions}. Drop the collection or fix GATEWAY_CACHE_EMBEDDING_DIMS."
             )
+
+
+def _neighbour(point: models.ScoredPoint) -> Neighbour:
+    payload = point.payload or {}
+    try:
+        answer = CachedAnswer(
+            str(payload["content"]), str(payload["finish_reason"]), str(payload["model"])
+        )
+        return Neighbour(answer, float(point.score), str(payload["question"]))
+    except KeyError as error:
+        raise AnswerStoreUnavailableError(f"malformed point {point.id}") from error
 
 
 def _vector_size(info: models.CollectionInfo) -> int | None:

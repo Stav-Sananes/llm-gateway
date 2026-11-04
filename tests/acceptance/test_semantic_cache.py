@@ -13,6 +13,7 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from harness.fake_llm import FakeLlmLog, FakeLlmScript, create_fake_llm
+from llm_gateway.cache.semantic import WARM_UP_TEXT
 from llm_gateway.config import Settings
 from llm_gateway.main import build_app
 from llm_gateway.storage.qdrant_cache import COLLECTION
@@ -26,6 +27,11 @@ QUESTION: dict[str, Any] = {
     "messages": [{"role": "user", "content": "What is the capital of France?"}],
 }
 REWORDED = QUESTION | {"messages": [{"role": "user", "content": "what is the capital of france"}]}
+
+
+def questions_embedded(log: FakeLlmLog) -> list[str]:
+    """What lookups embedded: the gateway's warm-up call at startup left out."""
+    return [text for text in log.embeddings if text != WARM_UP_TEXT]
 
 
 @pytest.fixture
@@ -155,7 +161,7 @@ def test_requests_without_a_low_temperature_skip_the_cache(
 
     assert [r.headers["x-gateway-cache"] for r in responses] == ["miss"] * 3
     assert len(log.requests) == 3
-    assert log.embeddings == []  # not even embedded
+    assert questions_embedded(log) == []  # not even embedded
 
 
 def test_cache_control_no_cache_gets_a_fresh_answer(
@@ -182,7 +188,7 @@ def test_with_qdrant_down_every_request_still_gets_an_answer(
     assert len(log.requests) == 8
     assert 'gateway_cache_lookups_total{result="unavailable"} 8.0' in metrics
     # The circuit opened: after the threshold, lookups stop trying to embed at all.
-    assert len(log.embeddings) == cached_settings.breaker_failure_threshold
+    assert len(questions_embedded(log)) == cached_settings.breaker_failure_threshold
 
 
 def test_a_cache_hit_is_recorded_as_free_usage_from_the_cache(
@@ -207,3 +213,14 @@ def test_a_cache_hit_is_recorded_as_free_usage_from_the_cache(
     assert (miss.charged_tokens, hit.charged_tokens) == (12, 0)
     assert 'gateway_cache_lookups_total{result="hit"} 1.0' in metrics
     assert "gateway_cache_similarity_threshold 0.95" in metrics
+
+
+def test_the_embedding_model_is_loaded_at_startup_before_any_question(
+    cached_settings: Settings, gateway: Gateway
+) -> None:
+    with gateway(cached_settings) as (_, log):
+        deadline = time.monotonic() + 5
+        while WARM_UP_TEXT not in log.embeddings and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    assert log.embeddings == [WARM_UP_TEXT]

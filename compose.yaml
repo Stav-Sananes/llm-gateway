@@ -11,6 +11,7 @@ services:
       GATEWAY_TRACING_ENABLED: "true"
       GATEWAY_CACHE_ENABLED: "true"
       GATEWAY_QDRANT_URL: http://qdrant:6333
+      GATEWAY_QDRANT_API_KEY: &qdrant_key ${QDRANT_API_KEY:-local-dev-qdrant-key}
       GATEWAY_CACHE_EMBEDDING_MODEL: &embedding_model nomic-embed-text
       GATEWAY_CACHE_EMBEDDING_DIMS: "768"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
@@ -33,6 +34,10 @@ services:
   ollama:
     image: ollama/ollama:0.40.12
     volumes: ["ollama:/root/.ollama"]
+    environment:
+      # Keep models loaded between requests: a reload takes longer than the semantic
+      # cache waits for an embedding, so every lookup after an idle spell would bypass it.
+      OLLAMA_KEEP_ALIVE: 24h
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 5s
@@ -51,9 +56,14 @@ services:
       ollama:
         condition: service_healthy
 
-  # Semantic cache. Losing it only costs cache misses, so no volume.
+  # Semantic cache. Losing it only costs cache misses, so no volume. Every tenant's cached
+  # answers live here, so it takes an API key, and a memory cap: a full Qdrant crashes and
+  # the gateway goes on uncached, instead of the host running out of memory.
   qdrant:
     image: qdrant/qdrant:v1.20.0
+    environment:
+      QDRANT__SERVICE__API_KEY: *qdrant_key
+    mem_limit: 1g
     ports: ["127.0.0.1:6333:6333"]
 
   jaeger:

@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from llm_gateway import telemetry
 from llm_gateway.audit.log import AuditLog
 from llm_gateway.authz.cedar_engine import CedarPolicyEngine, load_policies
-from llm_gateway.cache.semantic import CacheSettings, SemanticCache
+from llm_gateway.cache.semantic import CacheBreakers, CacheSettings, SemanticCache
 from llm_gateway.chat.ports import ChatProvider
 from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.config import Settings
@@ -154,6 +154,7 @@ def build_cache(
     # (and serve, uncached) without Qdrant.
     qdrant = AsyncQdrantClient(
         url=settings.qdrant_url,
+        api_key=settings.qdrant_api_key.get_secret_value() if settings.qdrant_api_key else None,
         timeout=max(1, int(settings.cache_timeout_s)),
         check_compatibility=False,
     )
@@ -162,8 +163,13 @@ def build_cache(
             embeddings_client, settings.cache_embedding_model, settings.cache_embedding_dims
         ),
         QdrantAnswerStore(qdrant, settings.cache_embedding_dims),
-        CircuitBreaker(
-            "semantic-cache", settings.breaker_failure_threshold, settings.breaker_reset_s
+        CacheBreakers(
+            embedder=CircuitBreaker(
+                "cache-embedder", settings.breaker_failure_threshold, settings.breaker_reset_s
+            ),
+            store=CircuitBreaker(
+                "cache-store", settings.breaker_failure_threshold, settings.breaker_reset_s
+            ),
         ),
         CacheSettings(
             similarity_threshold=settings.cache_similarity_threshold,
@@ -219,8 +225,12 @@ def build_app(settings: Settings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        async with mcp_sessions.run():
+        async with mcp_sessions.run(), anyio.create_task_group() as background:
+            if cache is not None:
+                background.start_soon(cache.warm_up)  # load the embedding model before traffic
+                background.start_soon(cache.run_writer)  # stores answers off the response path
             yield
+            background.cancel_scope.cancel()
         await upstream_client.aclose()
         if anthropic_client is not None:
             await anthropic_client.close()

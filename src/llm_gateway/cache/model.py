@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,15 @@ from llm_gateway.chat.model import ChatRequest, Message
 MAX_CACHEABLE_TEMPERATURE = 0.3
 # Longer answers aren't kept (and aren't collected while they stream).
 MAX_CACHED_ANSWER_CHARS = 64 * 1024
+# Longer questions match only word for word. An embedding of a long text is dominated by
+# its bulk, and past the model's context the tail is cut off: a shared document followed
+# by different instructions scores 1.0.
+MAX_SEMANTIC_QUESTION_CHARS = 1000
+# A cached answer is reused only if the questions also agree word for word this much.
+MIN_WORD_OVERLAP = 0.8
+# ChatRequest fields that change the answer, all in the context hash. A test fails when
+# ChatRequest gains a field that isn't here (or explicitly excluded).
+KEYED_REQUEST_FIELDS = frozenset({"model", "max_tokens", "temperature", "has_tools"})
 
 
 @dataclass(frozen=True)
@@ -57,23 +67,70 @@ def cache_key(tenant_id: UUID, request: ChatRequest) -> CacheKey | None:
         return None
     if request.temperature > MAX_CACHEABLE_TEMPERATURE:
         return None
-    if any(_is_tool_traffic(m) for m in request.messages):
-        return None
+    if any(_is_tool_traffic(m) or _text_only(m) is None for m in request.messages):
+        return None  # tool traffic, or anything but text anywhere (an image changes meaning)
     *context, last = request.messages
-    question = _text_only(last) if last.get("role") == "user" else None
-    if not question:
+    question = _text_only(last)
+    if last.get("role") != "user" or not question:
         return None
-    return CacheKey(tenant_id, _context_hash(request, context), question)
+    return CacheKey(tenant_id, _context_hash(request, context, last, question), question)
 
 
-def _context_hash(request: ChatRequest, context: Sequence[Message]) -> str:
+def lexically_compatible(question: str, cached_question: str) -> bool:
+    """A guard on top of similarity: embeddings place "safe" next to "unsafe" and "2" next
+    to "3". Numbers and negations must match exactly, no word may flip to its opposite
+    (un-/non-/in-/dis- forms), and most words must be shared."""
+    words, cached = _words(question), _words(cached_question)
+    if {w for w in words if w.isdigit()} != {w for w in cached if w.isdigit()}:
+        return False
+    if _negations(words) != _negations(cached) or _flipped(words ^ cached, words | cached):
+        return False
+    union = words | cached
+    return bool(union) and len(words & cached) / len(union) >= MIN_WORD_OVERLAP
+
+
+def _context_hash(
+    request: ChatRequest, context: Sequence[Message], last: Message, question: str
+) -> str:
+    keyed = {name: getattr(request, name) for name in sorted(KEYED_REQUEST_FIELDS)}
     canonical = json.dumps(
-        {"model": request.model, "max_tokens": request.max_tokens, "context": list(context)},
+        {
+            "request": keyed,
+            "context": list(context),
+            # Everything about the question except its text (a name, say)...
+            "last": {k: v for k, v in last.items() if k != "content"},
+            # ...and the text itself when it's too long to match by meaning.
+            "long_question": question if len(question) > MAX_SEMANTIC_QUESTION_CHARS else None,
+        },
         sort_keys=True,
         separators=(",", ":"),
         default=str,
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+_WORD = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
+_NEGATING_PREFIXES = ("un", "non", "in", "im", "ir", "il", "dis")
+_NEGATIONS = frozenset(
+    {"no", "not", "never", "none", "nothing", "nobody", "neither", "nor", "without", "cannot"}
+)
+
+
+def _words(text: str) -> set[str]:
+    return set(_WORD.findall(text.lower()))
+
+
+def _negations(words: set[str]) -> set[str]:
+    return {w for w in words if w in _NEGATIONS or w.endswith("n't")}
+
+
+def _flipped(differing: set[str], all_words: set[str]) -> bool:
+    """Does a word one question has and the other lacks negate a word either one has?"""
+    return any(
+        word.startswith(prefix) and word.removeprefix(prefix) in all_words
+        for word in differing
+        for prefix in _NEGATING_PREFIXES
+    )
 
 
 def _is_tool_traffic(message: Message) -> bool:

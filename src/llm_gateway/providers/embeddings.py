@@ -20,10 +20,9 @@ class OpenAICompatibleEmbedder:
                 "/embeddings", json={"model": self._model, "input": text}
             )
             response.raise_for_status()
-            vector = response.json()["data"][0]["embedding"]
+            return _checked(response.json()["data"][0]["embedding"], self._dimensions)
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             raise EmbedderUnavailableError(f"embedding failed: {type(error).__name__}") from error
-        return _checked(vector, self._dimensions)
 
 
 def _checked(vector: object, dimensions: int) -> list[float]:
