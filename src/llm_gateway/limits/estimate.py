@@ -14,3 +14,8 @@ _BYTES_PER_TOKEN = 3
 def estimate_prompt_tokens(messages: Sequence[Message]) -> int:
     size = len(json.dumps(list(messages), ensure_ascii=False, default=str).encode())
     return -(-size // _BYTES_PER_TOKEN)
+
+
+def estimate_text_tokens(text: str) -> int:
+    """The same upper-bound guess for plain text, e.g. an answer streamed so far."""
+    return -(-len(text.encode()) // _BYTES_PER_TOKEN)

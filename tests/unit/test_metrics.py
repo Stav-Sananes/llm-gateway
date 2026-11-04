@@ -58,6 +58,25 @@ async def test_a_request_no_provider_served_is_counted_under_none(metrics: Gatew
     )
 
 
+async def test_a_resumed_request_counts_once_as_a_request_and_once_as_a_resume(
+    metrics: GatewayMetrics,
+) -> None:
+    dead = a_usage_event(provider="claude", outcome=Outcome.RESUMED)
+    finished = a_usage_event(provider="ollama", outcome=Outcome.COMPLETED)
+
+    for event in (dead, finished):
+        await MeteredUsage(metrics, RecordedUsage()).record(event)
+
+    assert sample(metrics, "gateway_chat_resumes_total", provider="claude") == 1
+    assert (
+        sample(metrics, "gateway_chat_requests_total", provider="claude", outcome="resumed") is None
+    )
+    assert (
+        sample(metrics, "gateway_chat_requests_total", provider="ollama", outcome="completed") == 1
+    )
+    assert sample(metrics, "gateway_chat_tokens_total", provider="claude", kind="prompt") == 7
+
+
 def test_circuit_state_is_read_at_scrape_time(metrics: GatewayMetrics) -> None:
     breaker = CircuitBreaker("ollama", failure_threshold=1, reset_after_s=60)
     metrics.registry.register(CircuitStates([breaker]))

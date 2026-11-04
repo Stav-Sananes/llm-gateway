@@ -54,6 +54,12 @@ async def render_sse(
         logger.error("provider failed mid-stream: %s", error)
         yield _sse(error_payload(UPSTREAM_UNAVAILABLE, "upstream_error"))
         return
+    except Exception:
+        # The status line is long gone: anything else still ends in-band, never as a body
+        # cut off without [DONE].
+        logger.exception("chat stream failed mid-stream")
+        yield _sse(error_payload(UPSTREAM_UNAVAILABLE, "upstream_error"))
+        return
     finally:
         await rest.aclose()
     if include_usage and usage is not None:

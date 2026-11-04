@@ -2,8 +2,9 @@
 
 from collections.abc import AsyncGenerator
 from typing import Protocol
+from uuid import UUID
 
-from llm_gateway.chat.model import ChatRequest, CompletionChunk
+from llm_gateway.chat.model import ChatRequest, CompletionChunk, Origin
 
 # An AsyncGenerator (not just an iterator) so callers can aclose() it when the
 # client disconnects mid-stream, releasing the upstream connection immediately.
@@ -30,3 +31,20 @@ class ChatProvider(Protocol):
     def stream(self, request: ChatRequest) -> ChunkStream:
         """Stream the completion. Raises ProviderUnavailableError / ProviderRejectedError."""
         ...
+
+
+class ProviderSwitches(Protocol):
+    """Where the gateway notes that one provider continued an answer another one began."""
+
+    async def record(
+        self, tenant_id: UUID, requested_model: str, dead: Origin, resumed: Origin
+    ) -> None:
+        """Never raises: a lost note must not fail a request that was answered."""
+        ...
+
+
+class NoSwitchRecording:
+    async def record(
+        self, tenant_id: UUID, requested_model: str, dead: Origin, resumed: Origin
+    ) -> None:
+        pass

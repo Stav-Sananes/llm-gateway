@@ -174,3 +174,29 @@ async def test_a_provider_failing_after_its_first_chunk_still_counts_as_a_failur
         await collect(guarded.stream(REQUEST))
 
     assert breaker.state is BreakerState.OPEN
+
+
+async def test_a_provider_that_keeps_dying_mid_answer_opens_its_circuit() -> None:
+    # Each call streams before it dies: that first chunk must not count as a success,
+    # or the failures never add up (and resume would hide them from every client).
+    breaker = a_breaker(FakeClock(), threshold=2)
+    guarded = GuardedProvider(ScriptedProvider(OK, fail_after=True), breaker)
+
+    for _ in range(2):
+        with pytest.raises(ProviderUnavailableError):
+            await collect(guarded.stream(REQUEST))
+
+    assert breaker.state is BreakerState.OPEN
+
+
+async def test_a_trial_whose_client_leaves_mid_answer_frees_the_next_trial() -> None:
+    clock = FakeClock()
+    breaker = a_breaker(clock, threshold=1)
+    breaker.record_failure()
+    clock.now += 10
+    trial = GuardedProvider(ScriptedProvider(OK + OK), breaker).stream(REQUEST)
+
+    await anext(trial)
+    await trial.aclose()  # the client left: the trial told us nothing
+
+    assert breaker.try_acquire() is Permit.TRIAL
