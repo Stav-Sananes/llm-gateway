@@ -272,7 +272,10 @@ async def test_secrets_in_arguments_are_redacted_in_the_audit_log() -> None:
 
 
 async def a_held_call(
-    decide: str | None, store: InMemoryApprovalStore | None = None, max_pending: int = 10
+    decide: str | None,
+    store: InMemoryApprovalStore | None = None,
+    max_pending: int = 10,
+    audit: InMemoryAuditStore | None = None,
 ) -> tuple[ToolResult, FakeUpstreams, list[dict[str, Any]]]:
     """Call a tool that needs approval while an admin approves or rejects it (None: nobody
     decides and the hold times out)."""
@@ -280,7 +283,7 @@ async def a_held_call(
     hold = ApprovalHold(
         approvals, HoldSettings(timeout_s=0.2, poll_s=0.001, max_pending_per_tenant=max_pending)
     )
-    upstreams, audit = FakeUpstreams(), InMemoryAuditStore()
+    upstreams, audit = FakeUpstreams(), audit or InMemoryAuditStore()
     gateway = ToolGateway(
         upstreams, FixedPolicy(Decision.REQUIRE_APPROVAL, "fs-move"), AuditLog(audit),
         hold=hold,
@@ -347,3 +350,11 @@ async def test_a_tenant_with_too_many_held_calls_is_refused() -> None:
 
     assert "Too many" in result.content[0]["text"]
     assert upstreams.calls == []
+
+
+async def test_an_approved_call_does_not_run_when_its_approval_cant_be_audited() -> None:
+    result, upstreams, audited = await a_held_call("approve", audit=BrokenAuditStore(works_for=1))
+
+    assert result.content[0]["text"] == AUDIT_UNAVAILABLE
+    assert upstreams.calls == []
+    assert [a["action"] for a in audited] == ["tool.call.decided"]

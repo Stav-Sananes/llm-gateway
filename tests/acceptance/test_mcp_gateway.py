@@ -1,10 +1,12 @@
 """/mcp end to end: an MCP client, the gateway (auth, Cedar, audit chain) and fake upstreams."""
 
 import asyncio
+import contextlib
 import json
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +15,7 @@ import pytest
 from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
+from sqlalchemy import select
 
 from harness.fake_mcp import McpCallLog, create_fake_fs_server, create_fake_sql_server, slowed
 from llm_gateway.audit.log import AuditLog, Verification
@@ -20,6 +23,7 @@ from llm_gateway.cli import main as cli
 from llm_gateway.config import Settings
 from llm_gateway.main import build_app, build_engine
 from llm_gateway.storage.audit_store import PostgresAuditStore
+from llm_gateway.storage.tables import approvals as approvals_table
 from llm_gateway.storage.tenant_store import PostgresTenantStore
 from tests.support.backing_services import new_api_key
 from tests.support.servers import serving
@@ -39,8 +43,8 @@ class Gateway:
     fs: McpCallLog
 
 
-@pytest.fixture
-def gateway(services: Settings) -> Iterator[Gateway]:
+@contextmanager
+def running_gateway(services: Settings, **overrides: Any) -> Iterator[Gateway]:
     sql_log, fs_log = McpCallLog(), McpCallLog()
     with (
         serving(create_fake_sql_server(sql_log)) as sql_url,
@@ -52,9 +56,16 @@ def gateway(services: Settings) -> Iterator[Gateway]:
                 "approval_timeout_s": APPROVAL_TIMEOUT_S,
                 "approval_poll_s": 0.05,
             }
+            | overrides
         )
         with serving(build_app(settings)) as url:
             yield Gateway(f"{url}/mcp", new_api_key(services), sql_log, fs_log)
+
+
+@pytest.fixture
+def gateway(services: Settings) -> Iterator[Gateway]:
+    with running_gateway(services) as gateway:
+        yield gateway
 
 
 def mcp(
@@ -173,10 +184,12 @@ def test_a_held_call_runs_once_an_admin_approves_it(
     approval_id = waiting_approval(capsys)
     assert gateway.fs.calls == []  # still waiting
 
-    code, out, _ = approvals(capsys, "approve", approval_id, "--by", "dana")
+    code, out, err = approvals(capsys, "approve", approval_id, "--by", "dana", "--yes")
     thread.join(timeout=CLIENT_TIMEOUT_S)
 
-    assert (code, out.split()[0]) == (0, "approved")
+    assert code == 0, err
+    assert out.startswith("approved")
+    assert not thread.is_alive()
     [result] = results
     assert not result.is_error
     assert gateway.fs.calls == [("move_file", MOVE)]
@@ -192,13 +205,13 @@ def test_a_rejected_call_tells_the_client_why_and_never_runs(
     thread, results = held_call(gateway)
     approval_id = waiting_approval(capsys)
 
-    approvals(capsys, "reject", approval_id, "--by", "dana", "--note", "not today")
+    approvals(capsys, "reject", approval_id, "--by", "dana", "--note", "not today", "--yes")
     thread.join(timeout=CLIENT_TIMEOUT_S)
 
     [result] = results
     assert result.is_error and text(result) == "Rejected by dana: not today"
     assert gateway.fs.calls == []
-    code, _, err = approvals(capsys, "approve", approval_id, "--by", "dana")
+    code, _, err = approvals(capsys, "approve", approval_id, "--by", "dana", "--yes")
     assert code == 1 and "already rejected" in err
 
 
@@ -279,3 +292,99 @@ def test_the_configured_upstream_timeout_is_the_one_applied(services: Settings) 
 
     assert text(result) == "sql__query is unavailable."
     assert time.monotonic() - started < 5
+
+
+def held_until(settings: Settings, status: str) -> str:
+    """The id of the one held call, once its status is `status`."""
+
+    async def read() -> list[tuple[str, str]]:
+        engine = build_engine(settings)
+        try:
+            async with engine.connect() as connection:
+                rows = await connection.execute(
+                    select(approvals_table.c.id, approvals_table.c.status)
+                )
+                return [(str(row.id), row.status) for row in rows]
+        finally:
+            await engine.dispose()
+
+    deadline = time.monotonic() + APPROVAL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if (rows := asyncio.run(read())) and rows[0][1] == status:
+            return rows[0][0]
+        time.sleep(0.05)
+    raise AssertionError(f"no held call became {status}: {asyncio.run(read())}")
+
+
+def test_a_client_that_hangs_up_abandons_its_held_call(
+    gateway: Gateway, services: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    call = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {"name": "fs__move_file", "arguments": MOVE},
+    }
+    headers = MCP_HEADERS | {"Authorization": f"Bearer {gateway.api_key}"}
+    with contextlib.suppress(httpx.TimeoutException):  # the client gives up and hangs up
+        httpx.post(gateway.url, json=call, headers=headers, timeout=0.5)
+    approval_id = held_until(services, "abandoned")
+
+    code, _, err = approvals(capsys, "approve", approval_id, "--by", "dana", "--yes")
+
+    assert code == 1 and "already abandoned" in err
+    assert gateway.fs.calls == []  # nothing runs for a client that has gone
+
+
+def test_an_admin_sees_the_whole_call_and_must_confirm_before_it_is_decided(
+    gateway: Gateway, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    thread, results = held_call(gateway)
+    approval_id = waiting_approval(capsys)
+    answers = iter(["n", "y"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    declined = approvals(capsys, "approve", approval_id, "--by", "dana")
+    assert gateway.fs.calls == []
+    confirmed = approvals(capsys, "approve", approval_id, "--by", "dana")
+    thread.join(timeout=CLIENT_TIMEOUT_S)
+
+    assert declined[0] == 1 and '"destination": "/sandbox/b"' in declined[1]
+    assert confirmed[0] == 0 and gateway.fs.calls == [("move_file", MOVE)]
+    assert not results[0].is_error
+
+
+def test_show_prints_the_whole_call(gateway: Gateway, capsys: pytest.CaptureFixture[str]) -> None:
+    thread, _ = held_call(gateway)
+    approval_id = waiting_approval(capsys)
+
+    code, shown, _ = approvals(capsys, "show", approval_id)
+    approvals(capsys, "reject", approval_id, "--by", "dana", "--yes")
+    thread.join(timeout=CLIENT_TIMEOUT_S)
+
+    assert code == 0
+    details = json.loads(shown)
+    assert details["arguments"] == MOVE
+    assert (details["tool"], details["status"]) == ("fs__move_file", "pending")
+
+
+def test_the_decider_defaults_to_the_admins_login(
+    gateway: Gateway, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("getpass.getuser", lambda: "ops-oncall")
+    thread, _ = held_call(gateway)
+    approval_id = waiting_approval(capsys)
+
+    code, out, err = approvals(capsys, "reject", approval_id, "--yes")
+    thread.join(timeout=CLIENT_TIMEOUT_S)
+
+    assert code == 0, err
+    assert out.endswith("by ops-oncall")
+
+
+def test_the_per_tenant_limit_comes_from_settings(services: Settings) -> None:
+    with running_gateway(services, approval_max_pending_per_tenant=0) as gateway:
+        _, [result] = mcp(gateway, ("fs__move_file", MOVE))
+
+    assert result.is_error and "Too many" in text(result)
+    assert gateway.fs.calls == []

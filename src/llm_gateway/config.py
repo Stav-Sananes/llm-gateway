@@ -1,6 +1,6 @@
 """Runtime settings, read from GATEWAY_* environment variables."""
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +14,9 @@ class Settings(BaseSettings):
 
     host: str = "0.0.0.0"  # noqa: S104 - container listens on all interfaces
     port: int = 8080
+    # On SIGTERM, requests still running after this are cancelled (held approvals are then
+    # abandoned, cleanly). Keep it below the orchestrator's grace period (Kubernetes: 30 s).
+    shutdown_timeout_s: int = Field(default=20, gt=0)
 
     upstream_name: str = "ollama"
     upstream_base_url: str = "http://localhost:11434/v1"
@@ -49,9 +52,10 @@ class Settings(BaseSettings):
     # results over the second limit are withheld from the client.
     mcp_max_argument_bytes: int = Field(default=64 * 1024, gt=0)
     mcp_max_result_bytes: int = Field(default=1024 * 1024, gt=0)
-    # A call a policy holds for approval waits this long for a human (the MCP client's own
-    # request timeout must be longer); each tenant may have this many waiting at once.
-    approval_timeout_s: float = Field(default=120.0, gt=0, le=3600)
+    # A call a policy holds for approval waits this long for a human. The MCP client's own
+    # request timeout must be longer (60 s in the TypeScript SDK), or the client gives up
+    # first and the hold is abandoned. Each tenant may have this many waiting at once.
+    approval_timeout_s: float = Field(default=50.0, gt=0, le=3600)
     approval_poll_s: float = Field(default=0.5, gt=0)
     approval_max_pending_per_tenant: int = Field(default=10, ge=0)
 
@@ -96,6 +100,12 @@ class Settings(BaseSettings):
     default_max_tokens: int = Field(default=4096, gt=0)
 
     tracing_enabled: bool = False
+
+    @model_validator(mode="after")
+    def _approvals_poll_within_their_timeout(self) -> "Settings":
+        if self.approval_poll_s >= self.approval_timeout_s:
+            raise ValueError("approval_poll_s must be shorter than approval_timeout_s")
+        return self
 
     @field_validator("anthropic_api_key", mode="before")
     @classmethod

@@ -286,7 +286,12 @@ def build_app(settings: Settings) -> FastAPI:
 
 
 def run(settings: Settings) -> None:
-    uvicorn.run(build_app(settings), host=settings.host, port=settings.port)
+    uvicorn.run(
+        build_app(settings),
+        host=settings.host,
+        port=settings.port,
+        timeout_graceful_shutdown=settings.shutdown_timeout_s,
+    )
 
 
 async def run_usage_worker(settings: Settings) -> None:

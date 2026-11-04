@@ -21,7 +21,7 @@ from typing import Any
 
 import anyio
 
-from llm_gateway.approvals.hold import ApprovalHold
+from llm_gateway.approvals.hold import STAYS_WAITING, ApprovalHold, Waiter
 from llm_gateway.approvals.model import ApprovalStatus
 from llm_gateway.approvals.ports import ApprovalUnavailableError, TooManyPendingError
 from llm_gateway.audit.chain import UnauditableEventError
@@ -69,16 +69,20 @@ class ToolGateway:
         return await self._upstreams.list_tools()
 
     async def call(
-        self, tenant: Tenant, qualified_name: str, arguments: Mapping[str, Any]
+        self,
+        tenant: Tenant,
+        qualified_name: str,
+        arguments: Mapping[str, Any],
+        client: Waiter = STAYS_WAITING,  # a held call stops waiting once its client has left
     ) -> ToolResult:
         try:
-            return await self._governed_call(tenant, qualified_name, arguments)
+            return await self._governed_call(tenant, qualified_name, arguments, client)
         except _AUDIT_FAILURES as error:
             logger.error("tool call %s not made, audit failed: %s", qualified_name, error)
             return ToolResult.error(AUDIT_UNAVAILABLE)
 
     async def _governed_call(
-        self, tenant: Tenant, qualified_name: str, arguments: Mapping[str, Any]
+        self, tenant: Tenant, qualified_name: str, arguments: Mapping[str, Any], client: Waiter
     ) -> ToolResult:
         try:
             call = self._checked_call(tenant, qualified_name, arguments)
@@ -104,14 +108,16 @@ class ToolGateway:
         if decision.decision is Decision.DENY:
             return ToolResult.error(f"Denied by policy: {', '.join(decision.reasons)}")
         if decision.decision is Decision.REQUIRE_APPROVAL:
-            return await self._held(tenant, call, decision.reasons)
+            return await self._held(tenant, call, decision.reasons, client)
         return await self._forward(tenant, call)
 
-    async def _held(self, tenant: Tenant, call: ToolCall, reasons: Sequence[str]) -> ToolResult:
+    async def _held(
+        self, tenant: Tenant, call: ToolCall, reasons: Sequence[str], client: Waiter
+    ) -> ToolResult:
         if self._hold is None:
             return ToolResult.error("This call needs a human's approval, which isn't set up.")
         try:
-            approval = await self._hold.wait(call, reasons)
+            approval = await self._hold.wait(call, reasons, client)
         except TooManyPendingError:
             return ToolResult.error(
                 "Too many of this tenant's calls are already waiting for approval."
@@ -136,6 +142,8 @@ class ToolGateway:
         if approval.status is ApprovalStatus.REJECTED:
             why = f": {approval.note}" if approval.note else ""
             return ToolResult.error(f"Rejected by {approval.decided_by}{why}")
+        if approval.status is ApprovalStatus.ABANDONED:
+            return ToolResult.error("The call was abandoned: its client stopped waiting.")
         return ToolResult.error(
             f"Nobody approved this call within {self._hold.timeout_s:g} seconds."
         )

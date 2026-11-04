@@ -2,7 +2,10 @@
 
     hold (pending) ─► poll ─► approved / rejected by a human ─► the caller acts on it
                          └─► timeout ─► expired       (the gateway closes it)
-                         └─► client gone / error ─► abandoned
+                         └─► client gone / cancelled ─► abandoned
+
+A poll that fails (the store briefly unreachable) is retried until the deadline: a human
+may already have approved, and one bad read must not lose that.
 
 Every move out of `pending` is one conditional update, so when a human and the timeout
 decide at the same moment, exactly one wins and both sides see the same outcome.
@@ -13,6 +16,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 
 import anyio
 
@@ -25,9 +29,25 @@ logger = logging.getLogger(__name__)
 _CLOSE_TIMEOUT_S = 5.0  # closing a hold on the way out, even when cancelled
 
 
+class Waiter(Protocol):
+    """Whoever waits for the decision: the client of the held call."""
+
+    def has_left(self) -> bool: ...
+
+
+class _StaysWaiting:
+    def has_left(self) -> bool:
+        return False
+
+
+STAYS_WAITING = _StaysWaiting()
+
+
 @dataclass(frozen=True)
 class HoldSettings:
-    timeout_s: float = 120.0  # how long the client waits for a human
+    # How long the client waits for a human. Keep it below the MCP client's own request
+    # timeout (60 s in the TypeScript SDK), or the client gives up first.
+    timeout_s: float = 50.0
     poll_s: float = 0.5
     max_pending_per_tenant: int = 10  # each held call keeps a client request open
 
@@ -54,29 +74,44 @@ class ApprovalHold:
     def timeout_s(self) -> float:
         return self._settings.timeout_s
 
-    async def wait(self, call: ToolCall, reasons: Sequence[str]) -> Approval:
-        """Park the call and wait. Returns it approved, rejected or expired.
+    async def wait(
+        self, call: ToolCall, reasons: Sequence[str], waiter: Waiter = STAYS_WAITING
+    ) -> Approval:
+        """Park the call and wait. Returns it approved, rejected, expired, or abandoned
+        (its client left).
 
-        Raises TooManyPendingError, or ApprovalUnavailableError when the store fails:
-        either way the call must not run."""
+        Raises TooManyPendingError, or ApprovalUnavailableError when the store can't park
+        or close it: either way the call must not run."""
         approval = self._new(call, reasons)
-        await self._store.hold(approval, self._settings.max_pending_per_tenant, self._clock())
+        try:
+            await self._store.hold(approval, self._settings.max_pending_per_tenant, self._clock())
+        except anyio.get_cancelled_exc_class():
+            await self._abandon(approval)  # the insert may have committed before the cancel
+            raise
         logger.info("tool call %s held for approval %s", call.qualified_name, approval.id)
         try:
             with anyio.move_on_after(self._settings.timeout_s):
                 while True:
                     await anyio.sleep(self._settings.poll_s)
-                    current = await self._store.get(approval.id)
-                    if current is None:
-                        raise ApprovalUnavailableError(f"approval {approval.id} disappeared")
-                    if current.status is not ApprovalStatus.PENDING:
+                    if waiter.has_left():
+                        return await self._close(approval, ApprovalStatus.ABANDONED)
+                    if (current := await self._poll(approval)) is not None:
                         return current
             return await self._close(approval, ApprovalStatus.EXPIRED)
-        except BaseException:
-            # Cancelled (the client left) or failed: nobody is waiting for a decision now.
-            with anyio.move_on_after(_CLOSE_TIMEOUT_S, shield=True):
-                await self._close_quietly(approval)
+        except anyio.get_cancelled_exc_class():
+            await self._abandon(approval)  # shutting down: nobody will act on a decision
             raise
+
+    async def _poll(self, approval: Approval) -> Approval | None:
+        """The approval once decided; None while pending or unreadable for now."""
+        try:
+            current = await self._store.get(approval.id)
+        except ApprovalUnavailableError as error:
+            logger.warning("approval %s not readable, still waiting: %s", approval.id, error)
+            return None
+        if current is None:
+            raise ApprovalUnavailableError(f"approval {approval.id} disappeared")
+        return None if current.status is ApprovalStatus.PENDING else current
 
     def _new(self, call: ToolCall, reasons: Sequence[str]) -> Approval:
         now = self._clock()
@@ -101,8 +136,19 @@ class ApprovalHold:
             raise ApprovalUnavailableError(f"approval {approval.id} disappeared")
         return current
 
-    async def _close_quietly(self, approval: Approval) -> None:
-        try:
-            await self._store.decide(approval.id, ApprovalStatus.ABANDONED, GATEWAY, self._clock())
-        except ApprovalUnavailableError as error:
-            logger.warning("approval %s left pending: %s", approval.id, error)
+    async def _abandon(self, approval: Approval) -> None:
+        """Close the hold on the way out, even inside a cancellation. Never raises."""
+        with anyio.move_on_after(_CLOSE_TIMEOUT_S, shield=True):
+            try:
+                closed = await self._store.decide(
+                    approval.id, ApprovalStatus.ABANDONED, GATEWAY, self._clock()
+                )
+                current = closed or await self._store.get(approval.id)
+            except ApprovalUnavailableError as error:
+                logger.warning("approval %s left pending: %s", approval.id, error)
+                return
+            if closed is None and current is not None and current.decided_by != GATEWAY:
+                logger.warning(
+                    "approval %s was %s by %s, but its call was abandoned and won't run",
+                    approval.id, current.status, current.decided_by,
+                )  # fmt: skip

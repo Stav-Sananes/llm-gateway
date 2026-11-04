@@ -139,15 +139,115 @@ async def test_a_tenant_with_too_many_calls_waiting_is_refused_at_once() -> None
         tasks.cancel_scope.cancel()
 
 
-async def test_a_store_that_fails_while_waiting_is_unavailable_not_approved() -> None:
-    class FailsWhenPolled(InMemoryApprovalStore):
-        async def get(self, approval_id: UUID) -> Approval | None:
-            raise ApprovalUnavailableError("postgres down")
+async def test_a_store_down_for_the_whole_hold_is_unavailable_never_approved() -> None:
+    class DownOnceParked(InMemoryApprovalStore):
+        async def hold(self, approval: Approval, max_pending: int, now: datetime) -> None:
+            await super().hold(approval, max_pending, now)
+            self.down = True
 
-    hold = ApprovalHold(FailsWhenPolled(), HoldSettings(timeout_s=5, poll_s=0.001))
+    hold = ApprovalHold(DownOnceParked(), HoldSettings(timeout_s=0.05, poll_s=0.001))
 
     with anyio.fail_after(2), pytest.raises(ApprovalUnavailableError):
         await hold.wait(MOVE, REASONS)
+
+
+class LeftAfter:
+    """A client that hangs up after `polls` polls."""
+
+    def __init__(self, polls: int) -> None:
+        self._polls = polls
+
+    def has_left(self) -> bool:
+        self._polls -= 1
+        return self._polls < 0
+
+
+async def test_a_client_that_hangs_up_abandons_its_hold() -> None:
+    world = World()
+
+    with anyio.fail_after(2):
+        approval = await world.hold.wait(MOVE, REASONS, LeftAfter(polls=3))
+
+    assert (approval.status, approval.decided_by) == (ApprovalStatus.ABANDONED, GATEWAY)
+    assert world.store.approvals[approval.id].status is ApprovalStatus.ABANDONED
+
+
+async def test_polls_that_fail_for_a_while_do_not_lose_an_approval() -> None:
+    world = World()
+    result: list[Approval] = []
+
+    async def wait() -> None:
+        result.append(await world.hold.wait(MOVE, REASONS))
+
+    with anyio.fail_after(2):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(wait)
+            parked = await world.held()
+            await world.desk.approve(parked.id, "dana")
+            world.store.down = True  # before the hold reads the approval, its polls fail
+            await anyio.sleep(0.02)
+            world.store.down = False
+
+    assert result[0].status is ApprovalStatus.APPROVED
+
+
+async def test_a_hold_that_can_never_be_read_expires_and_never_runs() -> None:
+    class Unreadable(InMemoryApprovalStore):
+        async def get(self, approval_id: UUID) -> Approval | None:
+            raise ApprovalUnavailableError("pool timeout")
+
+    store = Unreadable()
+    hold = ApprovalHold(store, HoldSettings(timeout_s=0.05, poll_s=0.001))
+
+    with anyio.fail_after(2):
+        approval = await hold.wait(MOVE, REASONS)
+
+    assert approval.status is ApprovalStatus.EXPIRED
+    assert store.approvals[approval.id].status is ApprovalStatus.EXPIRED  # not left pending
+
+
+async def test_a_decision_made_after_many_polls_still_reaches_the_waiter() -> None:
+    class CountsPolls(InMemoryApprovalStore):
+        polls = 0
+        polled_three_times = anyio.Event()
+
+        async def get(self, approval_id: UUID) -> Approval | None:
+            self.polls += 1
+            if self.polls >= 3:
+                self.polled_three_times.set()
+            return await super().get(approval_id)
+
+    store = CountsPolls()
+    hold = ApprovalHold(store, HoldSettings(timeout_s=5, poll_s=0.001))
+    result: list[Approval] = []
+
+    async def wait() -> None:
+        result.append(await hold.wait(MOVE, REASONS))
+
+    with anyio.fail_after(2):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(wait)
+            await store.polled_three_times.wait()
+            (parked,) = store.approvals.values()
+            await ApprovalDesk(store).approve(parked.id, "dana")
+
+    assert result[0].status is ApprovalStatus.APPROVED
+
+
+async def test_a_hold_cancelled_while_being_parked_is_not_left_pending() -> None:
+    class SlowToCommit(InMemoryApprovalStore):
+        async def hold(self, approval: Approval, max_pending: int, now: datetime) -> None:
+            await super().hold(approval, max_pending, now)  # committed...
+            await anyio.sleep(60)  # ...but the caller is cancelled before it hears back
+
+    store = SlowToCommit()
+    hold = ApprovalHold(store, HoldSettings(timeout_s=5, poll_s=0.001))
+
+    with anyio.move_on_after(0.05):
+        await hold.wait(MOVE, REASONS)
+
+    (approval,) = store.approvals.values()
+    assert approval.status is ApprovalStatus.ABANDONED
 
 
 # The admin's desk
@@ -179,14 +279,14 @@ async def test_a_hold_past_its_expiry_cant_be_approved_even_if_still_pending() -
         parked = await world.held()
         tasks.cancel_scope.cancel()
     world.store.approvals[parked.id] = parked  # as if never closed
-    world.now += timedelta(seconds=10)
+    world.now = parked.expires_at  # not a moment past it: already too late
 
     with pytest.raises(ApprovalNotPendingError, match="expired"):
         await world.desk.approve(parked.id, "dana")
     assert world.store.approvals[parked.id].status is ApprovalStatus.EXPIRED
 
 
-@pytest.mark.parametrize("by", ["", GATEWAY])
+@pytest.mark.parametrize("by", ["", "  ", GATEWAY, "Gateway", " gateway "])
 async def test_a_decision_needs_a_persons_name(by: str) -> None:
     world = World()
 

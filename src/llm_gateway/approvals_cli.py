@@ -30,6 +30,9 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
         decide.add_argument("id", type=UUID)
         decide.add_argument("--note", help="why; the client sees it on a rejection")
         decide.add_argument("--by", default=None, help="who decides (default: your login)")
+        decide.add_argument(
+            "--yes", action="store_true", help="don't show the call and ask first (scripts)"
+        )
 
 
 def run(args: argparse.Namespace, settings: Settings) -> int:
@@ -46,10 +49,13 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         elif args.action == "show":
             print(_details(await desk.show(args.id)))
         else:
-            by = args.by or getpass.getuser()
+            by = args.by if args.by is not None else _login()
+            if not args.yes and not _confirmed(await desk.show(args.id), args.action):
+                print("nothing decided")
+                return 1
             decide = desk.approve if args.action == "approve" else desk.reject
             decided = await decide(args.id, by, args.note)
-            print(f"{decided.status} {decided.id} ({decided.tool}) by {decided.decided_by}")
+            print(f"{decided.status} {decided.id} ({_printable(decided.tool)}) by {by}")
     except (ApprovalNotFoundError, ApprovalNotPendingError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
@@ -61,13 +67,32 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _login() -> str:
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError) as error:  # no passwd entry, as in many containers
+        raise ValueError("can't tell who you are; pass --by NAME") from error
+
+
+def _confirmed(approval: Approval, action: str) -> bool:
+    """Show exactly what would run, then ask: the list's one-line summary can be cut off."""
+    print(_details(approval))
+    return input(f"{action} this call? [y/N] ").strip().lower() == "y"
+
+
+def _printable(text: str) -> str:
+    """Client-controlled text, safe to put on an admin's terminal: no control characters
+    (newlines, ANSI escapes) that could forge or hide a line."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
 def _summary(approval: Approval) -> str:
     left = (approval.expires_at - utc_now()).total_seconds()
     arguments = json.dumps(approval.arguments, sort_keys=True)
     if len(arguments) > _SHOWN_ARGUMENT_CHARS:
         arguments = arguments[:_SHOWN_ARGUMENT_CHARS] + "… (see `approvals show`)"
     return (
-        f"{approval.id}  {approval.tenant_name}  {approval.tool}  "
+        f"{approval.id}  {_printable(approval.tenant_name)}  {_printable(approval.tool)}  "
         f"expires in {left:.0f}s  {arguments}"
     )
 

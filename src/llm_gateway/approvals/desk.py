@@ -40,7 +40,7 @@ class ApprovalDesk:
     async def _decide(
         self, approval_id: UUID, status: ApprovalStatus, by: str, note: str | None
     ) -> Approval:
-        if not by or by == GATEWAY:
+        if not by.strip() or by.strip().casefold() == GATEWAY:
             raise ValueError("a decision needs the name of the person making it")
         approval = await self.show(approval_id)
         now = self._clock()
