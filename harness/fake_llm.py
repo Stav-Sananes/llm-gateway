@@ -115,3 +115,27 @@ def _usage_chunk(model: str, script: FakeLlmScript) -> dict[str, Any]:
 
 def _event(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def main() -> None:
+    """Serve the fake LLM on its own, for load and chaos runs. Configured by environment:
+    FAKE_LLM_TOKENS replies of that many tokens, FAKE_LLM_TOKEN_DELAY_S apart."""
+    import os
+
+    import uvicorn
+
+    tokens = int(os.environ.get("FAKE_LLM_TOKENS", "20"))
+    script = FakeLlmScript(
+        reply=tuple(f" token{i}" for i in range(tokens)),
+        token_delay_s=float(os.environ.get("FAKE_LLM_TOKEN_DELAY_S", "0.01")),
+    )
+    uvicorn.run(
+        create_fake_llm(script),
+        host="0.0.0.0",  # noqa: S104 - inside a container
+        port=int(os.environ.get("FAKE_LLM_PORT", "8000")),
+        log_level="warning",
+    )
+
+
+if __name__ == "__main__":
+    main()

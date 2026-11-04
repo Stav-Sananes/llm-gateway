@@ -3,7 +3,12 @@ import asyncio
 import pytest
 
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, collect
-from llm_gateway.chat.ports import ChunkStream, ProviderRejectedError, ProviderUnavailableError
+from llm_gateway.chat.ports import (
+    ChunkStream,
+    GatewayBusyError,
+    ProviderRejectedError,
+    ProviderUnavailableError,
+)
 from llm_gateway.routing.breaker import BreakerState, CircuitBreaker, GuardedProvider, Permit
 from tests.support.providers import ScriptedProvider
 
@@ -200,3 +205,18 @@ async def test_a_trial_whose_client_leaves_mid_answer_frees_the_next_trial() -> 
     await trial.aclose()  # the client left: the trial told us nothing
 
     assert breaker.try_acquire() is Permit.TRIAL
+
+
+async def test_the_gateways_own_saturation_does_not_count_against_the_provider() -> None:
+    class Busy:
+        async def stream(self, request: ChatRequest) -> ChunkStream:
+            raise GatewayBusyError("no free connection")
+            yield  # pragma: no cover - makes this a generator
+
+    breaker = a_breaker(FakeClock(), threshold=1)
+
+    for _ in range(3):
+        with pytest.raises(GatewayBusyError):
+            await collect(GuardedProvider(Busy(), breaker).stream(REQUEST))
+
+    assert breaker.state is BreakerState.CLOSED

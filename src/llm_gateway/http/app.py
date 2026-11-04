@@ -12,7 +12,8 @@ from llm_gateway.chat.use_case import ChatCompletions
 from llm_gateway.http.auth import bearer_tenant
 from llm_gateway.http.body_limit import BodyLimit, BodyTooLargeError, body_too_large
 from llm_gateway.http.errors import register_error_handlers
-from llm_gateway.http.routes import chat_router
+from llm_gateway.http.routes import CHAT_PATH, chat_router
+from llm_gateway.http.shed_load import ShedLoad
 from llm_gateway.metrics import GatewayMetrics, HttpMetrics, metrics_endpoint
 from llm_gateway.routing.breaker import BreakerState, CircuitBreaker
 from llm_gateway.tenancy.auth import Authenticator
@@ -28,10 +29,18 @@ def create_app(
     mcp_app: ASGIApp | None = None,
     metrics: GatewayMetrics | None = None,
     max_request_bytes: int = 4 * 1024 * 1024,
+    max_concurrent_chats: int = 64,
 ) -> FastAPI:
     app = FastAPI(title="LLM Gateway", lifespan=lifespan)
     register_error_handlers(app)
     app.add_middleware(BodyLimit, max_bytes=max_request_bytes)
+    # Added after BodyLimit, so it runs before it: a shed request costs nothing.
+    app.add_middleware(
+        ShedLoad,
+        max_in_flight=max_concurrent_chats,
+        paths=frozenset({CHAT_PATH}),
+        on_shed=metrics.chats_shed.inc if metrics is not None else lambda: None,
+    )
     app.add_exception_handler(BodyTooLargeError, body_too_large)
     if metrics is not None:
         app.add_middleware(HttpMetrics, metrics=metrics)

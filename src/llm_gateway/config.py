@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     upstream_connect_timeout_s: float = 2.0
     upstream_read_timeout_s: float = 60.0
     upstream_max_connections: int = 100
+    # Chat requests one process streams at once; more are refused with 503 (load shedding).
+    # Below upstream_max_connections, so the connection pool isn't what runs out first.
+    max_concurrent_chats: int = Field(default=64, gt=0)
 
     # Anthropic is enabled when a key is set. The base URL is only overridden in tests.
     anthropic_api_key: SecretStr | None = None

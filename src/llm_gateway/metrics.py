@@ -101,6 +101,11 @@ class GatewayMetrics:
             "Minimum similarity for a cache hit",
             registry=registry,
         )
+        self.chats_shed = Counter(
+            "gateway_chats_shed",
+            "Chat requests refused at the door: too many already in flight",
+            registry=registry,
+        )
         self.usage_events_dropped = Counter(
             "gateway_usage_events_dropped",
             "Usage events lost: the queue was down",

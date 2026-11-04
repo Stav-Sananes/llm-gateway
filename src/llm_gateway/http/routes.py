@@ -17,11 +17,13 @@ from llm_gateway.tenancy.model import Tenant
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
+CHAT_PATH = "/v1/chat/completions"
+
 
 def chat_router(chat: ChatCompletions, authenticated: TenantDependency) -> APIRouter:
     router = APIRouter()
 
-    @router.post("/v1/chat/completions", response_model=None)
+    @router.post(CHAT_PATH, response_model=None)
     async def create_chat_completion(
         body: ChatCompletionBody,
         tenant: Annotated[Tenant, Depends(authenticated)],

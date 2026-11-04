@@ -1,0 +1,23 @@
+# Load run: `docker compose -f compose.yaml -f load/compose.load.yaml up -d`, or load/run.sh.
+# The gateway's upstream becomes a fake LLM with a fixed latency, and per-tenant limits are
+# lifted, so what's measured is the gateway itself. See docs/design/13-load-test.md.
+services:
+  fake-llm:
+    build:
+      context: .
+      dockerfile: harness/Dockerfile
+    image: llm-gateway-fake-llm:dev
+    environment:
+      FAKE_LLM_TOKENS: "20"
+      FAKE_LLM_TOKEN_DELAY_S: "0.01"  # 20 tokens, 10 ms apart: about 200 ms per answer
+
+  gateway:
+    environment:
+      GATEWAY_UPSTREAM_BASE_URL: http://fake-llm:8000/v1
+      GATEWAY_RATE_LIMIT_BURST: "100000"
+      GATEWAY_RATE_LIMIT_PER_S: "100000"
+      GATEWAY_TOKEN_BUDGET_PER_DAY: "1000000000000"
+      GATEWAY_CACHE_ENABLED: "false"
+    depends_on:
+      fake-llm:
+        condition: service_started

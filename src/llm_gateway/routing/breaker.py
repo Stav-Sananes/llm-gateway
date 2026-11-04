@@ -11,7 +11,12 @@ from collections.abc import Callable
 from enum import Enum, StrEnum
 
 from llm_gateway.chat.model import ChatRequest
-from llm_gateway.chat.ports import ChatProvider, ChunkStream, ProviderUnavailableError
+from llm_gateway.chat.ports import (
+    ChatProvider,
+    ChunkStream,
+    GatewayBusyError,
+    ProviderUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +110,8 @@ class GuardedProvider:
                 yield chunk
             self.breaker.record_success()
             outcome_recorded = True
+        except GatewayBusyError:
+            raise  # our own saturation says nothing about the provider: permit released below
         except ProviderUnavailableError:
             self.breaker.record_failure()
             outcome_recorded = True

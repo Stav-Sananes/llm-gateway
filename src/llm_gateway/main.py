@@ -279,6 +279,7 @@ def build_app(settings: Settings) -> FastAPI:
         mcp_app=mcp_app,
         metrics=metrics,
         max_request_bytes=settings.max_request_bytes,
+        max_concurrent_chats=settings.max_concurrent_chats,
     )
     if tracer_provider is not None:
         telemetry.instrument(app, upstream_client)

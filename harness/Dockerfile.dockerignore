@@ -1,0 +1,5 @@
+# The main .dockerignore leaves harness/ out of the gateway image; this image is harness/.
+*
+!pyproject.toml
+!uv.lock
+!harness/*.py
