@@ -18,6 +18,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from llm_gateway import telemetry
+from llm_gateway.approvals.hold import ApprovalHold, HoldSettings
 from llm_gateway.audit.log import AuditLog
 from llm_gateway.audit.switches import AuditedSwitches
 from llm_gateway.authz.cedar_engine import CedarPolicyEngine, load_policies
@@ -43,6 +44,7 @@ from llm_gateway.providers.mcp_upstreams import HttpMcpUpstreams
 from llm_gateway.providers.openai_compatible import OpenAICompatibleProvider
 from llm_gateway.routing.breaker import CircuitBreaker, GuardedProvider
 from llm_gateway.routing.router import Router, Target
+from llm_gateway.storage.approval_store import PostgresApprovalStore
 from llm_gateway.storage.audit_store import PostgresAuditStore
 from llm_gateway.storage.key_cache import RedisKeyCache
 from llm_gateway.storage.qdrant_cache import QdrantAnswerStore
@@ -230,6 +232,14 @@ def build_app(settings: Settings) -> FastAPI:
         policy,
         audit,
         ToolLimits(settings.mcp_max_argument_bytes, settings.mcp_max_result_bytes),
+        hold=ApprovalHold(
+            PostgresApprovalStore(engine),
+            HoldSettings(
+                timeout_s=settings.approval_timeout_s,
+                poll_s=settings.approval_poll_s,
+                max_pending_per_tenant=settings.approval_max_pending_per_tenant,
+            ),
+        ),
     )
     mcp_app, mcp_sessions = build_mcp_app(build_mcp_server(tools), authenticator)
 
@@ -276,7 +286,12 @@ def build_app(settings: Settings) -> FastAPI:
 
 
 def run(settings: Settings) -> None:
-    uvicorn.run(build_app(settings), host=settings.host, port=settings.port)
+    uvicorn.run(
+        build_app(settings),
+        host=settings.host,
+        port=settings.port,
+        timeout_graceful_shutdown=settings.shutdown_timeout_s,
+    )
 
 
 async def run_usage_worker(settings: Settings) -> None:

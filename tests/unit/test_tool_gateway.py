@@ -3,14 +3,22 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
+import anyio
 import pytest
 
+from llm_gateway.approvals.desk import ApprovalDesk
+from llm_gateway.approvals.hold import ApprovalHold, HoldSettings
 from llm_gateway.audit.log import AuditLog
 from llm_gateway.audit.ports import AuditUnavailableError
 from llm_gateway.audit.redaction import REDACTED
 from llm_gateway.policy.model import Decision, PolicyDecision, ToolCall
 from llm_gateway.tenancy.model import Tenant
-from llm_gateway.tools.gateway import AUDIT_UNAVAILABLE, ToolGateway, result_fingerprint
+from llm_gateway.tools.gateway import (
+    APPROVALS_UNAVAILABLE,
+    AUDIT_UNAVAILABLE,
+    ToolGateway,
+    result_fingerprint,
+)
 from llm_gateway.tools.model import (
     ToolLimits,
     ToolResult,
@@ -18,6 +26,7 @@ from llm_gateway.tools.model import (
     UnknownToolError,
     UpstreamUnavailableError,
 )
+from tests.support.approvals import InMemoryApprovalStore
 from tests.support.in_memory_audit_store import InMemoryAuditStore
 
 pytestmark = pytest.mark.anyio
@@ -133,7 +142,7 @@ async def test_a_denied_call_never_reaches_the_upstream_and_says_why() -> None:
     assert decided["details"]["decision"] == "deny"
 
 
-async def test_a_call_needing_approval_is_refused_for_now() -> None:
+async def test_a_call_needing_approval_is_refused_when_approvals_arent_set_up() -> None:
     gateway, upstreams, store = a_gateway(FixedPolicy(Decision.REQUIRE_APPROVAL, "fs-move"))
 
     result = await gateway.call(ACME, "fs__move_file", {"source": "/sandbox/a"})
@@ -257,3 +266,95 @@ async def test_secrets_in_arguments_are_redacted_in_the_audit_log() -> None:
 
     [decided, _] = await actions(store)
     assert decided["details"]["arguments"]["password"] == REDACTED
+
+
+# The approval hold
+
+
+async def a_held_call(
+    decide: str | None,
+    store: InMemoryApprovalStore | None = None,
+    max_pending: int = 10,
+    audit: InMemoryAuditStore | None = None,
+) -> tuple[ToolResult, FakeUpstreams, list[dict[str, Any]]]:
+    """Call a tool that needs approval while an admin approves or rejects it (None: nobody
+    decides and the hold times out)."""
+    approvals = store or InMemoryApprovalStore()
+    hold = ApprovalHold(
+        approvals, HoldSettings(timeout_s=0.2, poll_s=0.001, max_pending_per_tenant=max_pending)
+    )
+    upstreams, audit = FakeUpstreams(), audit or InMemoryAuditStore()
+    gateway = ToolGateway(
+        upstreams, FixedPolicy(Decision.REQUIRE_APPROVAL, "fs-move"), AuditLog(audit),
+        hold=hold,
+    )  # fmt: skip
+    result: list[ToolResult] = []
+
+    async def call() -> None:
+        result.append(await gateway.call(ACME, "fs__move_file", MOVE))
+
+    with anyio.fail_after(2):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(call)
+            if decide is not None:
+                await approvals.held.wait()
+                (approval,) = approvals.approvals.values()
+                await getattr(ApprovalDesk(approvals), decide)(approval.id, "dana", "ok")
+    return result[0], upstreams, await actions(audit)
+
+
+MOVE = {"source": "/sandbox/a", "destination": "/sandbox/b"}
+
+
+async def test_an_approved_call_runs_after_its_approval_is_audited() -> None:
+    result, upstreams, audited = await a_held_call("approve")
+
+    assert result == OK
+    assert upstreams.calls == [("fs", "move_file", MOVE)]
+    assert [a["action"] for a in audited] == [
+        "tool.call.decided", "tool.call.approval", "tool.call.completed"
+    ]  # fmt: skip
+    approval = audited[1]["details"]
+    assert (approval["status"], approval["decided_by"]) == ("approved", "dana")
+
+
+async def test_a_rejected_call_never_runs() -> None:
+    result, upstreams, audited = await a_held_call("reject")
+
+    assert result.is_error and result.content[0]["text"] == "Rejected by dana: ok"
+    assert upstreams.calls == []
+    assert audited[-1]["details"]["status"] == "rejected"
+
+
+async def test_a_call_nobody_approves_in_time_never_runs() -> None:
+    result, upstreams, audited = await a_held_call(None)
+
+    assert result.is_error and "within 0.2 seconds" in result.content[0]["text"]
+    assert upstreams.calls == []
+    assert audited[-1]["details"]["status"] == "expired"
+
+
+async def test_when_approvals_are_down_a_held_call_does_not_run() -> None:
+    store = InMemoryApprovalStore()
+    store.down = True
+
+    result, upstreams, audited = await a_held_call(None, store)
+
+    assert result.content[0]["text"] == APPROVALS_UNAVAILABLE
+    assert upstreams.calls == []
+    assert [a["action"] for a in audited] == ["tool.call.decided"]
+
+
+async def test_a_tenant_with_too_many_held_calls_is_refused() -> None:
+    result, upstreams, _ = await a_held_call(None, max_pending=0)
+
+    assert "Too many" in result.content[0]["text"]
+    assert upstreams.calls == []
+
+
+async def test_an_approved_call_does_not_run_when_its_approval_cant_be_audited() -> None:
+    result, upstreams, audited = await a_held_call("approve", audit=BrokenAuditStore(works_for=1))
+
+    assert result.content[0]["text"] == AUDIT_UNAVAILABLE
+    assert upstreams.calls == []
+    assert [a["action"] for a in audited] == ["tool.call.decided"]

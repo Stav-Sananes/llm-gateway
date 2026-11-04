@@ -95,4 +95,29 @@ usage_events = Table(
     Index("ix_usage_events_tenant_id_started_at", "tenant_id", "started_at"),
 )
 
+# Tool calls a policy held for a human. The arguments are kept exactly (as JSON text):
+# they are what the human approves, and what runs.
+approvals = Table(
+    "approvals",
+    metadata,
+    Column("id", Uuid, primary_key=True),
+    Column("tenant_id", Uuid, ForeignKey("tenants.id"), nullable=False),
+    Column("tenant_name", Text, nullable=False),
+    Column("tool", Text, nullable=False),
+    Column("arguments", Text, nullable=False),
+    Column("reasons", Text, nullable=False),  # a JSON list of policy ids
+    Column("status", Text, nullable=False),
+    Column("requested_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("decided_at", DateTime(timezone=True)),
+    Column("decided_by", Text),
+    Column("note", Text),
+    CheckConstraint(
+        "status IN ('pending', 'approved', 'rejected', 'expired', 'abandoned')",
+        name="ck_approvals_status_known",
+    ),
+    # What's waiting, per tenant: the hold's limit and the admin's list.
+    Index("ix_approvals_status_tenant_id", "status", "tenant_id"),
+)
+
 TENANT_NAME_UNIQUE = "uq_tenants_name"

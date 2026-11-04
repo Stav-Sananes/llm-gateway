@@ -1,5 +1,5 @@
-"""Command line: serve, run the usage worker, migrate, administer tenants and keys, verify
-audit chains and check policies."""
+"""Command line: serve, run the usage worker, migrate, administer tenants and keys, decide
+held tool calls, verify audit chains and check policies."""
 
 import argparse
 import asyncio
@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from llm_gateway import approvals_cli
 from llm_gateway.audit.log import AuditLog
 from llm_gateway.authz.cedar_engine import CedarPolicyEngine, PolicyFileError, load_policies
 from llm_gateway.config import Settings
@@ -41,6 +42,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_verify_audit(args.tenant, settings))
     elif args.command == "policy":
         return _check_policies(args.file or settings.policy_file)
+    elif args.command == "approvals":
+        return approvals_cli.run(args, settings)
     else:
         return asyncio.run(_admin(args, settings))
     return 0
@@ -58,6 +61,8 @@ def _parser() -> argparse.ArgumentParser:
     actions.add_parser("create-tenant", help="add a tenant").add_argument("name")
     actions.add_parser("create-key", help="issue an API key (printed once)").add_argument("tenant")
     actions.add_parser("revoke-key", help="revoke an API key by its prefix").add_argument("prefix")
+
+    approvals_cli.add_commands(commands)
 
     audit = commands.add_parser("audit", help="check a tenant's audit chain")
     audit_actions = audit.add_subparsers(dest="action", required=True)
