@@ -24,9 +24,14 @@ class Settings(BaseSettings):
     # not the total generation time.
     upstream_connect_timeout_s: float = 2.0
     upstream_read_timeout_s: float = 60.0
+    # How long a provider may take to start answering (its first chunk), whatever it sends
+    # meanwhile. Counts as the provider failing: the router moves on and the breaker counts it.
+    upstream_first_chunk_timeout_s: float = Field(default=20.0, gt=0)
     # Per provider: the connection pool's size, and the bulkhead's (calls in flight at
-    # once). Real answers take seconds: in flight = requests/s * seconds per answer.
-    upstream_max_connections: int = Field(default=1000, gt=0)
+    # once). Real answers take seconds: in flight = requests/s * seconds per answer. Half
+    # of max_concurrent_chats, so a provider that freezes holds at most half the chat
+    # places until its calls time out, and the rest still reach the fallback.
+    upstream_max_connections: int = Field(default=512, gt=0)
     # Admission (see http/admission.py): new requests get a 503 while the event loop runs
     # later than this, or past these many in flight (chat and tool calls apart). Each
     # provider also takes at most upstream_max_connections calls at once.
@@ -96,8 +101,14 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     # Short: when Redis hangs, auth falls back to Postgres instead of waiting.
     redis_timeout_s: float = 0.25
-    # Upper bound on how long a revoked key can keep working if its cache entry wasn't cleared.
+    # A cached key is re-checked against Postgres after this long. Also the upper bound on
+    # how long a revoked key keeps working if its cache entry wasn't cleared, while Postgres
+    # is up.
     key_cache_ttl_s: int = 60
+    # How long a cached key is still accepted while Postgres is unavailable. The cost: a key
+    # revoked during that window, whose cache mark was also lost, works until Postgres is
+    # back or this runs out.
+    key_cache_stale_s: int = Field(default=3600, gt=0)
 
     # Per tenant. The bucket holds `rate_limit_burst` requests and refills at the given rate.
     rate_limit_burst: int = Field(default=20, gt=0)

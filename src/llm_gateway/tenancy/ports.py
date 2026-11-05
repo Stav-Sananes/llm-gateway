@@ -1,5 +1,6 @@
 """What tenant and key administration needs from storage."""
 
+from dataclasses import dataclass
 from typing import Protocol
 
 from llm_gateway.tenancy.model import StoredKey, Tenant
@@ -61,21 +62,35 @@ class Revoked:
 REVOKED = Revoked()
 
 
+@dataclass(frozen=True)
+class CachedTenant:
+    """A cached lookup. Fresh: confirmed against the store recently enough to trust as is.
+    Stale: to be confirmed again, but still usable while the store is unavailable."""
+
+    tenant: Tenant
+    fresh: bool
+
+
 class KeyCache(Protocol):
     """A fast copy of key-hash-to-tenant lookups. Postgres stays the source of truth.
 
     Every method raises KeyCacheUnavailableError when the cache can't be reached.
     """
 
-    async def tenant_for_key(self, key_hash: str) -> Tenant | Revoked | None:
+    async def tenant_for_key(self, key_hash: str) -> CachedTenant | Revoked | None:
         """Get the cached tenant for this key hash, REVOKED if it is marked revoked, or None."""
         ...
 
     async def remember(self, key_hash: str, tenant: Tenant) -> None:
-        """Cache the tenant for a limited time, unless the key hash already has an entry.
+        """Cache the tenant, fresh, unless the key hash already has an entry.
 
         Never overwriting is what stops a lookup that raced a revoke from re-caching the key.
         """
+        ...
+
+    async def refresh(self, key_hash: str, tenant: Tenant) -> None:
+        """Make an existing tenant entry fresh again. Does nothing if the entry is gone or
+        has been marked revoked meanwhile."""
         ...
 
     async def mark_revoked(self, key_hash: str) -> None:

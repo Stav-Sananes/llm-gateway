@@ -122,7 +122,12 @@ def build_router(
         for name in providers
     ]
     guarded: dict[str, ChatProvider] = {
-        b.name: GuardedProvider(providers[b.name], b, settings.upstream_max_connections)
+        b.name: GuardedProvider(
+            providers[b.name],
+            b,
+            settings.upstream_max_connections,
+            settings.upstream_first_chunk_timeout_s,
+        )
         for b in breakers
     }
     routes = {
@@ -231,7 +236,8 @@ def build_app(settings: Settings) -> FastAPI:
     engine = build_engine(settings)
     redis = build_redis(settings)
     authenticator = Authenticator(
-        PostgresTenantStore(engine), RedisKeyCache(redis, settings.key_cache_ttl_s)
+        PostgresTenantStore(engine),
+        RedisKeyCache(redis, settings.key_cache_ttl_s, settings.key_cache_stale_s),
     )
 
     metrics = GatewayMetrics(CollectorRegistry())

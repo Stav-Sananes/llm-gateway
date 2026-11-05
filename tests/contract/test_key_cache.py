@@ -10,7 +10,7 @@ from llm_gateway.main import build_redis
 from llm_gateway.storage.key_cache import RedisKeyCache
 from llm_gateway.tenancy.keys import issue_key
 from llm_gateway.tenancy.model import Tenant
-from llm_gateway.tenancy.ports import REVOKED, KeyCache
+from llm_gateway.tenancy.ports import REVOKED, CachedTenant, KeyCache
 from tests.support.in_memory_key_cache import InMemoryKeyCache
 
 pytestmark = pytest.mark.anyio
@@ -26,7 +26,7 @@ async def cache(request: pytest.FixtureRequest) -> AsyncIterator[KeyCache]:
     redis = build_redis(Settings(redis_url=request.getfixturevalue("redis_url")))
     try:
         await redis.flushdb()
-        yield RedisKeyCache(redis, ttl_s=60)
+        yield RedisKeyCache(redis, fresh_s=60)
     finally:
         await redis.aclose()
 
@@ -36,7 +36,7 @@ async def test_remembered_tenant_is_found(cache: KeyCache) -> None:
 
     await cache.remember(key_hash, ACME)
 
-    assert await cache.tenant_for_key(key_hash) == ACME
+    assert await cache.tenant_for_key(key_hash) == CachedTenant(ACME, fresh=True)
 
 
 async def test_unknown_key_hash_is_a_miss(cache: KeyCache) -> None:
@@ -68,4 +68,23 @@ async def test_remember_keeps_the_first_entry(cache: KeyCache) -> None:
 
     await cache.remember(key_hash, Tenant(id=uuid4(), name="globex"))
 
-    assert await cache.tenant_for_key(key_hash) == ACME
+    assert await cache.tenant_for_key(key_hash) == CachedTenant(ACME, fresh=True)
+
+
+async def test_refresh_never_replaces_a_revoked_mark(cache: KeyCache) -> None:
+    # A stale key re-checked just before a revoke must not bring the key back either.
+    key_hash = issue_key().key_hash
+    await cache.remember(key_hash, ACME)
+    await cache.mark_revoked(key_hash)
+
+    await cache.refresh(key_hash, ACME)
+
+    assert await cache.tenant_for_key(key_hash) is REVOKED
+
+
+async def test_refresh_does_not_create_an_entry(cache: KeyCache) -> None:
+    key_hash = issue_key().key_hash
+
+    await cache.refresh(key_hash, ACME)
+
+    assert await cache.tenant_for_key(key_hash) is None

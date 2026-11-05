@@ -10,7 +10,9 @@ import time
 from collections.abc import Callable
 from enum import Enum, StrEnum
 
-from llm_gateway.chat.model import ChatRequest
+import anyio
+
+from llm_gateway.chat.model import ChatRequest, CompletionChunk
 from llm_gateway.chat.ports import (
     ChatProvider,
     ChunkStream,
@@ -103,11 +105,16 @@ class GuardedProvider:
     and one slow provider can't take every place in the gateway."""
 
     def __init__(
-        self, provider: ChatProvider, breaker: CircuitBreaker, max_in_flight: int = 1000
+        self,
+        provider: ChatProvider,
+        breaker: CircuitBreaker,
+        max_in_flight: int = 1000,
+        first_chunk_timeout_s: float = 20.0,
     ) -> None:
         self._provider = provider
         self.breaker = breaker
         self._max_in_flight = max_in_flight
+        self._first_chunk_timeout_s = first_chunk_timeout_s
         self._in_flight = 0  # one event loop: no lock needed
 
     async def stream(self, request: ChatRequest) -> ChunkStream:
@@ -120,8 +127,11 @@ class GuardedProvider:
         chunks = self._provider.stream(request)
         outcome_recorded = False
         try:
-            async for chunk in chunks:
-                yield chunk
+            first = await self._first_chunk(chunks)
+            if first is not None:
+                yield first
+                async for chunk in chunks:
+                    yield chunk
             self.breaker.record_success()
             outcome_recorded = True
         except GatewayBusyError:
@@ -139,3 +149,15 @@ class GuardedProvider:
                 self._in_flight -= 1
                 if not outcome_recorded:  # rejected, or the client left: says nothing
                     self.breaker.release(permit)
+
+    async def _first_chunk(self, chunks: ChunkStream) -> CompletionChunk | None:
+        """The read timeout bounds each read, not the wait for the answer to start: a
+        provider sending keep-alive pings, or a byte at a time, would never trip it. This
+        bounds how long a frozen provider can hold a request before it counts as a failure."""
+        try:
+            with anyio.fail_after(self._first_chunk_timeout_s):
+                return await anext(chunks, None)
+        except TimeoutError as error:
+            raise ProviderUnavailableError(
+                f"{self.breaker.name}: no answer within {self._first_chunk_timeout_s} s"
+            ) from error

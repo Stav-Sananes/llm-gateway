@@ -235,3 +235,19 @@ async def test_losing_the_race_to_create_the_collection_checks_the_winners_size(
     else:
         with pytest.raises(AnswerStoreUnavailableError, match="8-dimension"):
             await store.nearest(KEY, vector(KEY.question), 0.95, NOW, limit=3)
+
+
+async def test_a_collection_lost_with_its_qdrant_is_created_again(
+    qdrant: AsyncQdrantClient,
+) -> None:
+    # Qdrant has no volume: when it restarts, it comes back empty.
+    store = await stored(qdrant, KEY)
+    await qdrant.delete_collection(COLLECTION)
+
+    with pytest.raises(AnswerStoreUnavailableError):
+        await store.nearest(KEY, vector(KEY.question), 0.95, NOW, limit=3)
+    await store.put(KEY, vector(KEY.question), ANSWER, NOW + 60)
+    await qdrant.count(COLLECTION)
+
+    found = await nearest(store, KEY)
+    assert found is not None and found.answer == ANSWER

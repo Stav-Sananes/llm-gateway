@@ -5,7 +5,13 @@ from contextlib import suppress
 
 from llm_gateway.tenancy.keys import hash_key, looks_like_key
 from llm_gateway.tenancy.model import Tenant
-from llm_gateway.tenancy.ports import KeyCache, KeyCacheUnavailableError, Revoked, TenantStore
+from llm_gateway.tenancy.ports import (
+    KeyCache,
+    KeyCacheUnavailableError,
+    Revoked,
+    TenantStore,
+    TenantStoreUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +23,11 @@ class InvalidApiKeyError(Exception):
 
 
 class Authenticator:
-    """Looks a key up in the cache first and in the store on a miss.
+    """Looks a key up in the cache first and in the store when the cache has no fresh entry.
 
-    When the cache is down, every lookup goes to the store: slower, but still correct.
+    When the cache is down, every lookup goes to the store: slower, but still correct. When
+    the store is down, a key the cache confirmed recently (a stale entry) still works, so a
+    Postgres outage doesn't stop every tenant once the fresh entries run out.
     """
 
     def __init__(self, store: TenantStore, cache: KeyCache) -> None:
@@ -38,11 +46,25 @@ class Authenticator:
             return await self._stored_tenant(key_hash)
         if isinstance(cached, Revoked):
             raise InvalidApiKeyError(_UNKNOWN_OR_REVOKED)
-        if cached is not None:
-            return cached
-        tenant = await self._stored_tenant(key_hash)
+        if cached is not None and cached.fresh:
+            return cached.tenant
+        try:
+            tenant = await self._stored_tenant(key_hash)
+        except TenantStoreUnavailableError:
+            if cached is None:
+                raise  # never confirmed: "not now", never "invalid"
+            logger.warning("tenant store unavailable; accepting a key confirmed earlier")
+            return cached.tenant
+        except InvalidApiKeyError:
+            if cached is not None:  # revoked since it was cached, and the mark was missed
+                with suppress(KeyCacheUnavailableError):
+                    await self._cache.mark_revoked(key_hash)
+            raise
         with suppress(KeyCacheUnavailableError):
-            await self._cache.remember(key_hash, tenant)
+            if cached is None:
+                await self._cache.remember(key_hash, tenant)
+            else:
+                await self._cache.refresh(key_hash, tenant)
         return tenant
 
     async def _stored_tenant(self, key_hash: str) -> Tenant:

@@ -109,7 +109,7 @@ async def _verify_audit(tenant_name: str, settings: Settings) -> int:
 async def _admin(args: argparse.Namespace, settings: Settings) -> int:
     engine = build_engine(settings)
     redis = build_redis(settings)
-    cache = RedisKeyCache(redis, settings.key_cache_ttl_s)
+    cache = RedisKeyCache(redis, settings.key_cache_ttl_s, settings.key_cache_stale_s)
     admin = TenantAdmin(PostgresTenantStore(engine), cache)
     try:
         await _run_admin_action(admin, args)

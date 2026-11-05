@@ -33,7 +33,10 @@ async def real_store_and_cache(
     engine = build_engine(settings)
     redis = build_redis(settings)
     try:
-        yield PostgresTenantStore(engine), RedisKeyCache(redis, settings.key_cache_ttl_s)
+        yield (
+            PostgresTenantStore(engine),
+            RedisKeyCache(redis, settings.key_cache_ttl_s, settings.key_cache_stale_s),
+        )
     finally:
         await redis.aclose()
         await engine.dispose()
