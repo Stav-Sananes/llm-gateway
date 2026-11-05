@@ -24,10 +24,15 @@ class Settings(BaseSettings):
     # not the total generation time.
     upstream_connect_timeout_s: float = 2.0
     upstream_read_timeout_s: float = 60.0
-    upstream_max_connections: int = 100
-    # Chat requests one process streams at once; more are refused with 503 (load shedding).
-    # Below upstream_max_connections, so the connection pool isn't what runs out first.
-    max_concurrent_chats: int = Field(default=64, gt=0)
+    # Per provider: the connection pool's size, and the bulkhead's (calls in flight at
+    # once). Real answers take seconds: in flight = requests/s * seconds per answer.
+    upstream_max_connections: int = Field(default=1000, gt=0)
+    # Admission (see http/admission.py): new requests get a 503 while the event loop runs
+    # later than this, or past these many in flight (chat and tool calls apart). Each
+    # provider also takes at most upstream_max_connections calls at once.
+    max_loop_lag_s: float = Field(default=0.05, gt=0)
+    max_concurrent_chats: int = Field(default=1024, gt=0)
+    max_concurrent_tool_calls: int = Field(default=256, gt=0)
 
     # Anthropic is enabled when a key is set. The base URL is only overridden in tests.
     anthropic_api_key: SecretStr | None = None

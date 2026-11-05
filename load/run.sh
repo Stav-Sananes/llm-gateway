@@ -3,6 +3,8 @@
 # through the gateway. Needs Docker. Usage: load/run.sh [RPS] [DURATION]
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# The stack publishes the same host ports as the dev stack (8080, 16686, ...): stop that first.
+# Each run leaves one tenant behind (named load-<timestamp>).
 
 RPS="${1:-50}"
 DURATION="${2:-60s}"
@@ -13,7 +15,7 @@ K6_IMAGE=grafana/k6:1.3.0
 "${COMPOSE[@]}" up -d --build --wait gateway fake-llm usage-worker
 tenant="load-$(date +%s)"
 "${COMPOSE[@]}" exec -T gateway llm-gateway admin create-tenant "$tenant" >/dev/null
-key="$("${COMPOSE[@]}" exec -T gateway llm-gateway admin create-key "$tenant" 2>/dev/null)"
+key="$("${COMPOSE[@]}" exec -T gateway llm-gateway admin create-key "$tenant")"
 
 k6() {  # name, target URL, API key
   echo "--- $1: $RPS requests/s for $DURATION"

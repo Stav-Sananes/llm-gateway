@@ -10,6 +10,10 @@ services:
     environment:
       FAKE_LLM_TOKENS: "20"
       FAKE_LLM_TOKEN_DELAY_S: "0.01"  # 20 tokens, 10 ms apart: about 200 ms per answer
+    healthcheck:  # so `up --wait` waits for it
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8000))"]
+      interval: 2s
+      retries: 15
 
   gateway:
     environment:

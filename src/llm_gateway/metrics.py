@@ -101,9 +101,15 @@ class GatewayMetrics:
             "Minimum similarity for a cache hit",
             registry=registry,
         )
-        self.chats_shed = Counter(
-            "gateway_chats_shed",
-            "Chat requests refused at the door: too many already in flight",
+        self.requests_shed = Counter(
+            "gateway_requests_shed",
+            "Requests refused because this process was too busy (loop lag or in-flight cap)",
+            ["kind"],
+            registry=registry,
+        )
+        self.loop_lag = Gauge(
+            "gateway_event_loop_lag_seconds",
+            "How late the event loop runs: the signal admission sheds on",
             registry=registry,
         )
         self.usage_events_dropped = Counter(

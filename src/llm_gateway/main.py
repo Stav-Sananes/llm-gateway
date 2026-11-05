@@ -26,6 +26,7 @@ from llm_gateway.cache.semantic import CacheBreakers, CacheSettings, SemanticCac
 from llm_gateway.chat.ports import ChatProvider, ProviderSwitches
 from llm_gateway.chat.use_case import NO_SWITCH_RECORDING, ChatCompletions
 from llm_gateway.config import Settings
+from llm_gateway.http.admission import Admission, AdmissionLimits, LoopLag
 from llm_gateway.http.app import create_app
 from llm_gateway.http.mcp_endpoint import build_mcp_app, build_mcp_server
 from llm_gateway.limits.policies import FailOpenRateLimiter, UnlimitedBudget
@@ -112,7 +113,8 @@ def build_router(
         for name in providers
     ]
     guarded: dict[str, ChatProvider] = {
-        b.name: GuardedProvider(providers[b.name], b) for b in breakers
+        b.name: GuardedProvider(providers[b.name], b, settings.upstream_max_connections)
+        for b in breakers
     }
     routes = {
         model: [Target(t.provider, t.model) for t in targets]
@@ -223,6 +225,18 @@ def build_app(settings: Settings) -> FastAPI:
         PostgresTenantStore(engine), RedisKeyCache(redis, settings.key_cache_ttl_s)
     )
 
+    metrics = GatewayMetrics(CollectorRegistry())
+    metrics.registry.register(CircuitStates(breakers))
+    lag = LoopLag()
+    metrics.loop_lag.set_function(lambda: lag.lag_s)
+    limits = AdmissionLimits(settings.max_concurrent_chats, settings.max_loop_lag_s)
+    chat_admission = Admission(lag, limits, metrics.requests_shed.labels("chat").inc)
+    tool_admission = Admission(
+        lag,
+        AdmissionLimits(settings.max_concurrent_tool_calls, settings.max_loop_lag_s),
+        metrics.requests_shed.labels("tool_call").inc,
+    )
+
     # Loaded now, so a broken policy file stops the gateway from starting.
     policy = CedarPolicyEngine(load_policies(settings.policy_file))
     audit = AuditLog(PostgresAuditStore(engine))
@@ -241,11 +255,12 @@ def build_app(settings: Settings) -> FastAPI:
             ),
         ),
     )
-    mcp_app, mcp_sessions = build_mcp_app(build_mcp_server(tools), authenticator)
+    mcp_app, mcp_sessions = build_mcp_app(build_mcp_server(tools, tool_admission), authenticator)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         async with mcp_sessions.run(), anyio.create_task_group() as background:
+            background.start_soon(lag.run)  # measures the event loop's lag, for admission
             background.start_soon(switches.run)  # audits provider switches off the response path
             if cache is not None:
                 background.start_soon(cache.warm_up)  # load the embedding model before traffic
@@ -262,8 +277,6 @@ def build_app(settings: Settings) -> FastAPI:
         if tracer_provider is not None:
             tracer_provider.shutdown()
 
-    metrics = GatewayMetrics(CollectorRegistry())
-    metrics.registry.register(CircuitStates(breakers))
     usage = MeteredUsage(
         metrics,
         RedisUsageStream(
@@ -279,7 +292,7 @@ def build_app(settings: Settings) -> FastAPI:
         mcp_app=mcp_app,
         metrics=metrics,
         max_request_bytes=settings.max_request_bytes,
-        max_concurrent_chats=settings.max_concurrent_chats,
+        chat_admission=chat_admission,
     )
     if tracer_provider is not None:
         telemetry.instrument(app, upstream_client)

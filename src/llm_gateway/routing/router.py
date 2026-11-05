@@ -20,6 +20,7 @@ from llm_gateway.chat.model import ChatRequest, CompletionChunk, Origin
 from llm_gateway.chat.ports import (
     ChatProvider,
     ChunkStream,
+    GatewayBusyError,
     ProviderRejectedError,
     ProviderUnavailableError,
 )
@@ -58,6 +59,7 @@ class Router:
 
     async def stream(self, request: ChatRequest) -> ChunkStream:
         failures: list[str] = []
+        all_busy = True  # every target refused because this gateway was saturated
         sent = ""  # the answer so far, as the client has seen it
         previous: Origin | None = None  # the target that died mid-answer
         for target in self.targets_for(request.model):
@@ -70,10 +72,12 @@ class Router:
                 first = await anext(chunks)
             except (StopAsyncIteration, ProviderUnavailableError) as error:
                 await chunks.aclose()
+                all_busy = all_busy and isinstance(error, GatewayBusyError)
                 failures.append(self._unavailable(target, str(error) or "empty stream"))
                 continue
             except ProviderRejectedError as error:
                 await chunks.aclose()
+                all_busy = False
                 if previous is None:  # the client's own request: wrong everywhere
                     raise
                 # Only the continuation was refused (say, the partial answer pushed it past
@@ -101,9 +105,11 @@ class Router:
                 if finished:  # the answer was whole; only its usage report was lost
                     raise
                 failures.append(self._unavailable(target, f"died mid-answer: {error}"))
-                previous = origin
+                previous, all_busy = origin, False
             finally:
                 await chunks.aclose()
+        if all_busy and failures:
+            raise GatewayBusyError("; ".join(failures))  # 503 and Retry-After, not 502
         raise ProviderUnavailableError("; ".join(failures))
 
     def _unavailable(self, target: Target, reason: str) -> str:

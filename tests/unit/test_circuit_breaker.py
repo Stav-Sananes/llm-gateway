@@ -220,3 +220,35 @@ async def test_the_gateways_own_saturation_does_not_count_against_the_provider()
             await collect(GuardedProvider(Busy(), breaker).stream(REQUEST))
 
     assert breaker.state is BreakerState.CLOSED
+
+
+async def test_past_its_bulkhead_a_provider_refuses_at_once_without_a_mark_against_it() -> None:
+    breaker = a_breaker(FakeClock(), threshold=1)
+    guarded = GuardedProvider(ScriptedProvider(OK + OK), breaker, max_in_flight=1)
+    holding = guarded.stream(REQUEST)
+    await anext(holding)  # one call in flight
+
+    with pytest.raises(GatewayBusyError):
+        await collect(guarded.stream(REQUEST))
+    await holding.aclose()
+
+    assert breaker.state is BreakerState.CLOSED
+    assert (await collect(guarded.stream(REQUEST))).content == "okok"  # its place is free
+
+
+async def test_the_gateways_own_saturation_during_a_trial_frees_the_trial() -> None:
+    class Busy:
+        async def stream(self, request: ChatRequest) -> ChunkStream:
+            raise GatewayBusyError("no free connection")
+            yield  # pragma: no cover - makes this a generator
+
+    clock = FakeClock()
+    breaker = a_breaker(clock, threshold=1)
+    breaker.record_failure()
+    clock.now += 10  # half-open: the next call is the trial
+
+    with pytest.raises(GatewayBusyError):
+        await collect(GuardedProvider(Busy(), breaker).stream(REQUEST))
+
+    assert breaker.state is BreakerState.HALF_OPEN  # nothing learned about the provider
+    assert breaker.try_acquire() is Permit.TRIAL  # and the next call may try

@@ -28,6 +28,9 @@ class FakeLlmScript:
     omit_done: bool = False  # end the stream cleanly but without the [DONE] line
     embedding_dims: int = 64
     embed_fail_status: int | None = None
+    # Send the headers with the first token, as the gateway does, instead of at once: then
+    # "time to first byte" means the same thing directly and through the gateway.
+    headers_with_first_token: bool = False
 
 
 @dataclass
@@ -52,7 +55,10 @@ def create_fake_llm(script: FakeLlmScript, log: FakeLlmLog | None = None) -> Fas
             return JSONResponse(
                 {"error": {"message": script.fail_message}}, status_code=script.fail_status
             )
-        return StreamingResponse(_stream(script, body["model"]), media_type="text/event-stream")
+        stream = _stream(script, body["model"])
+        if script.headers_with_first_token:
+            stream = _primed(await anext(stream), stream)
+        return StreamingResponse(stream, media_type="text/event-stream")
 
     @app.post("/v1/embeddings")
     async def embeddings(request: Request) -> Response:
@@ -88,6 +94,12 @@ async def _stream(script: FakeLlmScript, model: str) -> AsyncIterator[str]:
     yield _event(_usage_chunk(model, script))
     if not script.omit_done:
         yield "data: [DONE]\n\n"
+
+
+async def _primed(first: str, rest: AsyncIterator[str]) -> AsyncIterator[str]:
+    yield first
+    async for event in rest:
+        yield event
 
 
 def _chunk(model: str, delta: dict[str, str], finish_reason: str | None) -> dict[str, Any]:
@@ -128,6 +140,7 @@ def main() -> None:
     script = FakeLlmScript(
         reply=tuple(f" token{i}" for i in range(tokens)),
         token_delay_s=float(os.environ.get("FAKE_LLM_TOKEN_DELAY_S", "0.01")),
+        headers_with_first_token=True,
     )
     uvicorn.run(
         create_fake_llm(script),

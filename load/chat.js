@@ -1,6 +1,6 @@
 // Load test: chat completions at a constant arrival rate, streamed like a real client.
 // Run once against the fake LLM directly and once through the gateway; the difference
-// in latency is what the gateway adds. See docs/proof/load.md.
+// in latency is what the gateway adds. See docs/design/13-load-test.md.
 import http from "k6/http";
 import { check } from "k6";
 
@@ -17,11 +17,18 @@ export const options = {
       rate: RPS,
       timeUnit: "1s",
       duration: DURATION,
-      preAllocatedVUs: RPS * 2,
+      preAllocatedVUs: RPS * 4, // enough for multi-second answers: "dropped" means k6 ran out
       maxVUs: RPS * 10,
     },
   },
   summaryTrendStats: ["p(50)", "p(90)", "p(99)", "max"],
+  // Thresholds that always pass: they make k6 keep the sub-metrics of served (2xx)
+  // responses, so fast 503s from load shedding don't flatter the percentiles.
+  thresholds: {
+    checks: ["rate>0.99"], // fail the run (exit 99) when answers fail: run.sh stops on it
+    "http_req_duration{expected_response:true}": ["max>=0"],
+    "http_req_waiting{expected_response:true}": ["max>=0"],
+  },
 };
 
 const BODY = JSON.stringify({
@@ -43,8 +50,9 @@ export default function () {
 // One JSON line on stdout instead of k6's text summary; load/summary.py prints it.
 export function handleSummary(data) {
   const m = data.metrics;
-  const duration = m.http_req_duration.values;
-  const firstByte = m.http_req_waiting.values;
+  // Served responses only (see the thresholds above).
+  const duration = m["http_req_duration{expected_response:true}"].values;
+  const firstByte = m["http_req_waiting{expected_response:true}"].values;
   return {
     stdout:
       JSON.stringify({
