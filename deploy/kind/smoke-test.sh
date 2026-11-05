@@ -77,7 +77,8 @@ chat
 step "security context"
 uid=$(kubectl -n "$NS" exec "deploy/$FULL" -- id -u)
 [[ "$uid" == 10001 ]] || { echo "runs as uid $uid, expected 10001" >&2; exit 1; }
-if kubectl -n "$NS" exec "deploy/$FULL" -- touch /app/probe 2>/dev/null; then
+# $HOME, not /app: uid 10001 can write its home on a writable filesystem, never /app.
+if kubectl -n "$NS" exec "deploy/$FULL" -- sh -c 'touch "$HOME/probe"' 2>/dev/null; then
   echo "root filesystem is writable" >&2; exit 1
 fi
 echo "uid 10001, read-only root filesystem: ok"
