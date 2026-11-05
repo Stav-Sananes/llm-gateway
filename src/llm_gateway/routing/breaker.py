@@ -131,7 +131,11 @@ class GuardedProvider:
             outcome_recorded = True
             raise
         finally:
-            self._in_flight -= 1
-            await chunks.aclose()
-            if not outcome_recorded:  # rejected, or the client left: says nothing either way
-                self.breaker.release(permit)
+            try:
+                await chunks.aclose()  # hands the connection back to the pool
+            finally:
+                # Only now: freed earlier, the next call could take the slot and find no
+                # free connection.
+                self._in_flight -= 1
+                if not outcome_recorded:  # rejected, or the client left: says nothing
+                    self.breaker.release(permit)

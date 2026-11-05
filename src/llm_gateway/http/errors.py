@@ -2,6 +2,7 @@
 
 import logging
 import math
+import random
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -12,7 +13,7 @@ from llm_gateway.chat.ports import (
     ProviderRejectedError,
     ProviderUnavailableError,
 )
-from llm_gateway.http.admission import AtCapacityError
+from llm_gateway.http.admission import AtCapacityError, at_capacity_response
 from llm_gateway.http.presenter import UPSTREAM_UNAVAILABLE, error_payload
 from llm_gateway.limits.ports import (
     BudgetExhaustedError,
@@ -90,13 +91,11 @@ async def _budget_unavailable(_: Request, error: Exception) -> JSONResponse:
 
 
 async def _at_capacity(_: Request, error: Exception) -> JSONResponse:
-    # Our own capacity, not the provider's: 503 and when to come back, not 502.
-    retry_after = error.retry_after_s if isinstance(error, AtCapacityError) else 1
-    return JSONResponse(
-        error_payload("The gateway is at capacity. Retry shortly.", "service_unavailable"),
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        headers={"Retry-After": str(retry_after)},
-    )
+    if isinstance(error, AtCapacityError):
+        return at_capacity_response(error.retry_after_s)
+    # Every provider's connections are in use: jittered too, so the clients turned away
+    # together don't come back together.
+    return at_capacity_response(random.randint(1, 3))  # noqa: S311 - not a secret
 
 
 async def _provider_unavailable(_: Request, error: Exception) -> JSONResponse:

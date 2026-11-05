@@ -6,7 +6,7 @@ import pytest
 from fastapi import FastAPI, Request
 from pydantic import ValidationError
 
-from llm_gateway.http.body_limit import BodyLimit, BodyTooLargeError, body_too_large
+from llm_gateway.http.body_limit import BodyLimit
 from llm_gateway.http.schemas import MAX_COMPLETION_TOKENS, ChatCompletionBody
 
 pytestmark = pytest.mark.anyio
@@ -33,7 +33,6 @@ def test_max_tokens_has_an_upper_bound() -> None:
 
 def echo_app() -> FastAPI:
     app = FastAPI()
-    app.add_exception_handler(BodyTooLargeError, body_too_large)  # as create_app does
 
     @app.post("/echo")
     async def echo(request: Request) -> dict[str, int]:

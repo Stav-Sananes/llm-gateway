@@ -7,18 +7,29 @@ requests are refused (503, Retry-After) while the loop runs late, and past a har
 requests in flight. Idle streams waiting on a slow model cost almost nothing, so the cap
 is high: it is a backstop, the lag is the signal.
 
-Admission happens after the body is read and the key checked: a client that never
-finishes sending its body, or has no valid key, holds nothing here.
+Two checks, in two places:
+- The lag is checked at the door (ShedWhileLagging), before the body is read or the key
+  checked: refusing must cost almost nothing, or the work done before refusing keeps the
+  loop busy. That check holds nothing, so it can't be abused to hold places.
+- A place in flight is taken after the body is read and the key checked (admit()): a
+  client that never finishes sending its body, or has no valid key, holds nothing here.
 """
 
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import NoReturn
 
 import anyio
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from llm_gateway.http.presenter import error_payload
 
 LAG_SAMPLE_S = 0.05
-_SMOOTHING = 0.3  # weight of the newest sample: one blip (a GC pause) doesn't shed alone
+# Weight of the newest sample. At the default 50 ms threshold, a single late sample sheds
+# only when it is over about 170 ms (0.3 x 170 = 51): ordinary GC pauses don't shed alone.
+_SMOOTHING = 0.3
 
 
 class AtCapacityError(Exception):
@@ -71,15 +82,25 @@ class Admission:
     def in_flight(self) -> int:
         return self._in_flight
 
+    def refuse_if_lagging(self) -> None:
+        """The check at the door: raises AtCapacityError while the event loop runs late."""
+        if self._lagging():
+            self._refuse()
+
     def admit(self) -> "Ticket":
         """A ticket to release when the work is done. Raises AtCapacityError."""
-        busy = self._lag.lag_s > self._limits.max_loop_lag_s
-        if busy or self._in_flight >= self._limits.max_in_flight:
-            self._on_shed()
-            # Jittered, so refused clients don't all come back in the same second.
-            raise AtCapacityError(self._jitter())
+        if self._lagging() or self._in_flight >= self._limits.max_in_flight:
+            self._refuse()
         self._in_flight += 1
         return Ticket(self)
+
+    def _lagging(self) -> bool:
+        return self._lag.lag_s > self._limits.max_loop_lag_s
+
+    def _refuse(self) -> NoReturn:
+        self._on_shed()
+        # Jittered, so refused clients don't all come back in the same second.
+        raise AtCapacityError(self._jitter())
 
     def _release(self) -> None:
         self._in_flight -= 1
@@ -94,3 +115,33 @@ class Ticket:
         if self._admission is not None:
             self._admission._release()
             self._admission = None
+
+
+class ShedWhileLagging:
+    """The check at the door: while the event loop runs late, requests to the given paths
+    get a 503 before their body is read or their key checked. Refused here, a request
+    costs almost nothing; refused after parsing and auth, it would cost nearly as much as
+    serving it, and the loop would stay saturated by the work done before refusing."""
+
+    def __init__(self, app: ASGIApp, admissions: Mapping[str, Admission]) -> None:
+        self._app = app
+        self._admissions = admissions
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        admission = self._admissions.get(scope["path"]) if scope["type"] == "http" else None
+        try:
+            if admission is not None:
+                admission.refuse_if_lagging()
+        except AtCapacityError as error:
+            await at_capacity_response(error.retry_after_s)(scope, receive, send)
+            return
+        await self._app(scope, receive, send)
+
+
+def at_capacity_response(retry_after_s: int) -> JSONResponse:
+    # Our own capacity, not the provider's: 503 and when to come back, not 502.
+    return JSONResponse(
+        error_payload("The gateway is at capacity. Retry shortly.", "service_unavailable"),
+        status_code=503,
+        headers={"Retry-After": str(retry_after_s)},
+    )

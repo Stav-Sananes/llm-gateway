@@ -1,7 +1,8 @@
 """Refuse request bodies over a size limit, before anything reads them into memory."""
 
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+import contextlib
+
+from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from llm_gateway.http.presenter import error_payload
@@ -11,12 +12,6 @@ class BodyTooLargeError(Exception):
     def __init__(self, max_bytes: int) -> None:
         super().__init__(f"request body is over {max_bytes} bytes")
         self.max_bytes = max_bytes
-
-
-async def body_too_large(_: Request, error: Exception) -> Response:
-    """The app's handler for a chunked body cut off mid-read (raised from receive())."""
-    max_bytes = error.max_bytes if isinstance(error, BodyTooLargeError) else 0
-    return too_large_response(max_bytes)
 
 
 def too_large_response(max_bytes: int) -> JSONResponse:
@@ -31,7 +26,7 @@ def too_large_response(max_bytes: int) -> JSONResponse:
 class BodyLimit:
     """413 when Content-Length is over the limit. A body without Content-Length (chunked)
     is counted as it arrives and cut off when it goes over: receive() raises
-    BodyTooLargeError, which the app's `body_too_large` handler turns into a 413."""
+    BodyTooLargeError, and the 413 replaces whatever the app would have answered."""
 
     def __init__(self, app: ASGIApp, max_bytes: int) -> None:
         self._app = app
@@ -46,27 +41,32 @@ class BodyLimit:
             await self._too_large(scope, receive, send)
             return
         received = 0
-        responded = False
+        cut_off = False
+        started = False
 
         async def counting_receive() -> Message:
-            nonlocal received
+            nonlocal received, cut_off
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > self._max_bytes:
+                    cut_off = True
                     raise BodyTooLargeError(self._max_bytes)
             return message
 
-        async def tracking_send(message: Message) -> None:
-            nonlocal responded
-            responded = responded or message["type"] == "http.response.start"
+        async def guarded_send(message: Message) -> None:
+            nonlocal started
+            if cut_off:
+                # Whatever the app answers to a body it never got whole (FastAPI makes it a
+                # 400 "error parsing the body", Starlette a 500) is replaced by the 413.
+                return
+            started = started or message["type"] == "http.response.start"
             await send(message)
 
-        try:
-            await self._app(scope, counting_receive, tracking_send)
-        except BodyTooLargeError:
-            if not responded:
-                await self._too_large(scope, receive, send)
+        with contextlib.suppress(BodyTooLargeError):
+            await self._app(scope, counting_receive, guarded_send)
+        if cut_off and not started:
+            await self._too_large(scope, receive, send)
 
     async def _too_large(self, scope: Scope, receive: Receive, send: Send) -> None:
         await too_large_response(self._max_bytes)(scope, receive, send)

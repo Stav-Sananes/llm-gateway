@@ -4,12 +4,17 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import anyio
 import pytest
 from pydantic import SecretStr
 
 from harness.fake_anthropic import FakeAnthropicLog, FakeAnthropicScript, create_fake_anthropic
 from llm_gateway.chat.model import ChatRequest, Completion, collect
-from llm_gateway.chat.ports import ProviderRejectedError, ProviderUnavailableError
+from llm_gateway.chat.ports import (
+    GatewayBusyError,
+    ProviderRejectedError,
+    ProviderUnavailableError,
+)
 from llm_gateway.config import Settings
 from llm_gateway.main import build_anthropic_client
 from llm_gateway.providers.anthropic import AnthropicProvider
@@ -290,3 +295,35 @@ async def test_refusal_fallbacks_can_be_switched_off() -> None:
 
     assert "fallbacks" not in log.requests[0]
     assert "anthropic-beta" not in log.headers[0]
+
+
+async def test_no_free_connection_is_the_gateway_busy_not_anthropic_down() -> None:
+    # A pool of one, sized from the settings like the bulkhead; the first call holds it.
+    settings = Settings(
+        anthropic_api_key=SecretStr("sk-test"),
+        upstream_max_connections=1,
+        upstream_connect_timeout_s=0.05,  # also the pool wait
+    )
+    errors: list[Exception] = []
+    with serving(create_fake_anthropic(FakeAnthropicScript(token_delay_s=0.3))) as url:
+        client = build_anthropic_client(settings.model_copy(update={"anthropic_base_url": url}))
+        assert client is not None
+        provider = AnthropicProvider(client, default_max_tokens=4096)
+
+        async def ask() -> None:
+            try:
+                await complete(provider, a_request())
+            except ProviderUnavailableError as error:
+                errors.append(error)
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(ask)
+                await anyio.sleep(0.2)  # the first call holds the only connection
+                tasks.start_soon(ask)
+        finally:
+            await client.close()
+
+    (error,) = errors
+    # Counted as the provider failing, it would open Anthropic's circuit under our own load.
+    assert isinstance(error, GatewayBusyError)

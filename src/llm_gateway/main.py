@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager, suppress
 import anthropic
 import anyio
 import httpx
+import httpx2
 import prometheus_client
 import uvicorn
 from fastapi import FastAPI
@@ -91,6 +92,14 @@ def build_anthropic_client(settings: Settings) -> anthropic.AsyncAnthropic | Non
         ),
         # The router falls back to the next provider; SDK retries would only add latency.
         max_retries=0,
+        # The pool matches the provider's bulkhead (GuardedProvider): the bulkhead refuses
+        # before a call can wait on a pool with no free connection.
+        http_client=anthropic.DefaultAsyncHttpxClient(
+            limits=httpx2.Limits(
+                max_connections=settings.upstream_max_connections,
+                max_keepalive_connections=min(100, settings.upstream_max_connections),
+            )
+        ),
     )
 
 
@@ -293,6 +302,7 @@ def build_app(settings: Settings) -> FastAPI:
         metrics=metrics,
         max_request_bytes=settings.max_request_bytes,
         chat_admission=chat_admission,
+        tool_admission=tool_admission,
     )
     if tracer_provider is not None:
         telemetry.instrument(app, upstream_client)

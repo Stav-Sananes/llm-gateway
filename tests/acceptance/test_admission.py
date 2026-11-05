@@ -1,9 +1,11 @@
 """Admission end to end: a busy gateway refuses with 503 and Retry-After, never 502, and
 nothing a client does before its key is checked can take a place."""
 
+import re
 import socket
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from typing import Any
 from urllib.parse import urlsplit
@@ -119,3 +121,62 @@ def test_a_client_that_leaves_mid_stream_frees_its_place(services: Settings) -> 
         answers = [admitted_soon(client, []) for _ in range(2)]
 
     assert [a.status_code for a in answers] == [200, 200]
+
+
+def test_a_refused_key_holds_no_place(services: Settings) -> None:
+    with a_gateway(services, max_concurrent_chats=1) as client:
+        refused_keys = [
+            client.post(
+                "/v1/chat/completions", json=QUESTION, headers={"Authorization": "Bearer gw_bad"}
+            ).status_code
+            for _ in range(3)
+        ]
+        answer = client.post("/v1/chat/completions", json=QUESTION)
+
+    assert refused_keys == [401, 401, 401]
+    assert answer.status_code == 200
+
+
+def test_a_non_streamed_answer_holds_its_place_until_it_is_complete(services: Settings) -> None:
+    whole = QUESTION | {"stream": False}
+    with a_gateway(services, max_concurrent_chats=1) as client:
+        with ThreadPoolExecutor(1) as pool:
+            first = pool.submit(client.post, "/v1/chat/completions", json=whole)
+            time.sleep(0.5)  # admitted, and waiting on the slow upstream
+            meanwhile = client.post("/v1/chat/completions", json=whole)
+            first_answer = first.result()
+        after = admitted_soon(client, [])
+
+    assert refused(meanwhile)
+    assert (first_answer.status_code, after.status_code) == (200, 200)
+
+
+def test_while_the_loop_runs_late_requests_are_refused_before_their_key_is_checked(
+    services: Settings,
+) -> None:
+    # Any lag at all is over this limit, so the door refuses as soon as it is measured.
+    with a_gateway(services, max_loop_lag_s=1e-9) as client:
+        deadline = time.monotonic() + 3
+        while True:
+            unknown_key = client.post(
+                "/v1/chat/completions", json=QUESTION, headers={"Authorization": "Bearer gw_bad"}
+            )
+            if unknown_key.status_code != 401 or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        tool_call = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        metrics = client.get("/metrics").text
+
+    # A 503, not a 401: refused at the door, so the refusal costs no key lookup.
+    assert refused(unknown_key)
+    assert refused(tool_call)
+    assert 'gateway_requests_shed_total{kind="tool_call"} 1.0' in metrics
+
+
+def test_the_gateway_measures_its_event_loop_lag(services: Settings) -> None:
+    with a_gateway(services) as client:
+        time.sleep(0.3)  # a few samples
+        metrics = client.get("/metrics").text
+
+    (lag,) = re.findall(r"^gateway_event_loop_lag_seconds (\S+)$", metrics, re.MULTILINE)
+    assert 0 < float(lag) < 1  # measured: never set, it would read exactly 0

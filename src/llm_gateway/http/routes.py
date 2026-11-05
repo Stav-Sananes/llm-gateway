@@ -2,6 +2,7 @@
 
 from typing import Annotated, Any
 
+import anyio
 from fastapi import APIRouter, Depends, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.types import Receive, Scope, Send
@@ -20,6 +21,7 @@ from llm_gateway.tenancy.model import Tenant
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 CHAT_PATH = "/v1/chat/completions"
+_CLOSE_UPSTREAM_S = 5
 
 
 def chat_router(
@@ -54,6 +56,7 @@ def chat_router(
             return JSONResponse(completion_payload(identity, completion), headers=headers)
         return _ReleasingStream(
             ticket,
+            chunks,
             render_sse(identity, first, chunks, include_usage=body.include_usage),
             media_type="text/event-stream",
             headers=_SSE_HEADERS | headers,
@@ -64,17 +67,24 @@ def chat_router(
 
 class _ReleasingStream(StreamingResponse):
     """Frees its admission ticket once the response is over, however it ends: finished,
-    failed, or the client gone before the first byte."""
+    failed, or the client gone before the first byte. In that last case the body never
+    started, so its own cleanup never ran: the upstream stream (a bulkhead slot and a
+    connection) is closed here, rather than whenever the garbage collector gets to it."""
 
-    def __init__(self, ticket: Ticket, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, ticket: Ticket, upstream: ChunkStream, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._ticket = ticket
+        self._upstream = upstream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
             await super().__call__(scope, receive, send)
         finally:
-            self._ticket.release()
+            try:
+                with anyio.move_on_after(_CLOSE_UPSTREAM_S, shield=True):
+                    await self._upstream.aclose()  # a no-op once the body has closed it
+            finally:
+                self._ticket.release()
 
 
 def _from_cache(chunk: CompletionChunk | None) -> bool:
