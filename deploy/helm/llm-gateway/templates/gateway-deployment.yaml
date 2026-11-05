@@ -21,9 +21,9 @@ spec:
       labels:
         {{- include "llm-gateway.selector" $component | nindent 8 }}
       annotations:
-        # Roll the pods when their settings change.
+        # Roll the pods when their settings change. Not for the Secret: its checksum would
+        # put a hash of every password in the pod spec, readable by anyone who can get pods.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.gateway.port | quote }}
         prometheus.io/path: /metrics

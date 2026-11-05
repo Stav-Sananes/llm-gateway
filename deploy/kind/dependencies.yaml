@@ -17,7 +17,7 @@ spec:
             - {name: POSTGRES_DB, value: gateway}
           ports: [{containerPort: 5432}]
           readinessProbe:
-            exec: {command: ["pg_isready", "-U", "gateway"]}
+            exec: {command: ["pg_isready", "-h", "127.0.0.1", "-U", "gateway"]}  # TCP: the socket answers during init
             periodSeconds: 2
 ---
 apiVersion: v1

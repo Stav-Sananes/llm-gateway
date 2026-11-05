@@ -321,6 +321,7 @@ def run(settings: Settings) -> None:
         host=settings.host,
         port=settings.port,
         timeout_graceful_shutdown=settings.shutdown_timeout_s,
+        timeout_keep_alive=settings.keep_alive_timeout_s,
     )
 
 

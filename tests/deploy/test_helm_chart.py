@@ -227,3 +227,71 @@ def test_the_disruption_budget_never_blocks_a_drain_of_a_single_replica(
             }
         },
     }
+
+
+def test_the_migration_can_have_its_own_existing_secret(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    manifests = render(
+        existingSecret="app-role",
+        migrations={"existingSecret": "owner-role"},
+        secrets={"databaseUrl": "", "redisUrl": ""},
+    )
+
+    job = pod_specs(manifests)["gw-llm-gateway-migrate"]["containers"][0]
+    (url,) = [e for e in job["env"] if e["name"] == "GATEWAY_DATABASE_URL"]
+    assert url["valueFrom"]["secretKeyRef"]["name"] == "owner-role"
+
+
+def test_the_migration_secret_is_removed_even_when_the_migration_fails(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    secret = find(render(), "Secret", "gw-llm-gateway-migrate")
+
+    # It holds the credentials of a role allowed to change the schema.
+    assert "hook-failed" in secret["metadata"]["annotations"]["helm.sh/hook-delete-policy"]
+
+
+def test_a_failed_migration_pod_is_never_replaced_while_it_still_runs(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    job = find(render(), "Job", "gw-llm-gateway-migrate")
+
+    assert job["spec"]["podReplacementPolicy"] == "Failed"  # never two migrations at once
+
+
+def test_no_hash_of_the_secret_is_put_in_the_pod_spec(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    # Anyone who can read pods could test password guesses against it offline.
+    for name, deployment in [
+        (m["metadata"]["name"], m) for m in render() if m["kind"] == "Deployment"
+    ]:
+        annotations = deployment["spec"]["template"]["metadata"]["annotations"]
+        assert "checksum/secret" not in annotations, name
+        assert "checksum/config" in annotations, name
+
+
+def test_a_digest_pins_the_image_over_the_tag(render: Callable[..., list[Manifest]]) -> None:
+    digest = "sha256:" + "a" * 64
+    specs = pod_specs(render(image={"tag": "moved", "digest": digest}))
+
+    assert {s["containers"][0]["image"] for s in specs.values()} == {f"llm-gateway@{digest}"}
+
+
+def test_extra_environment_sources_reach_every_long_running_container(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    extra = {"secretRef": {"name": "mcp-servers"}}
+    specs = pod_specs(render(extraEnvFrom=[extra]))
+
+    for name in ("gw-llm-gateway", "gw-llm-gateway-usage-worker"):
+        assert extra in specs[name]["containers"][0]["envFrom"], name
+
+
+def test_a_setting_the_chart_owns_is_refused_in_config() -> None:
+    # Two GATEWAY_PORT keys would make the ConfigMap invalid, or silently drop one.
+    done = helm("template", "gw", "llm-gateway", values=merged(REQUIRED, {"config": {"PORT": "9"}}))
+
+    assert done.returncode != 0
+    assert "config.PORT is set by the chart" in done.stderr

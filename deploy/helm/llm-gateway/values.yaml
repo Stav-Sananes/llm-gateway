@@ -5,6 +5,8 @@
 image:
   repository: llm-gateway
   tag: ""            # defaults to the chart's appVersion
+  # sha256:..., to pin the exact build; it wins over the tag. Tags can be moved.
+  digest: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -12,6 +14,8 @@ imagePullSecrets: []
 # Connection strings and keys. Prefer existingSecret: a Secret you manage, with the keys
 # GATEWAY_DATABASE_URL, GATEWAY_REDIS_URL and, if used, GATEWAY_ANTHROPIC_API_KEY and
 # GATEWAY_QDRANT_API_KEY. When it is empty, the chart creates one from `secrets`.
+# Pods don't restart when a Secret changes: after rotating a password or a key, run
+#   kubectl rollout restart deployment -l app.kubernetes.io/instance=<release>
 existingSecret: ""
 secrets:
   databaseUrl: ""
@@ -33,6 +37,9 @@ config:
 
 # Extra environment variables, e.g. OTEL_EXPORTER_OTLP_ENDPOINT.
 extraEnv: []
+# Extra sources of environment variables, e.g. a Secret holding GATEWAY_MCP_SERVERS when
+# its URLs carry tokens: [{secretRef: {name: mcp-servers}}].
+extraEnvFrom: []
 
 # Cedar policies for tool calls. Empty: the packaged defaults.
 policy: ""
@@ -71,6 +78,10 @@ usageWorker:
 migrations:
   # Run `llm-gateway migrate` as a Helm hook before every install and upgrade.
   enabled: true
+  # With existingSecret: a Secret of your own with the migration role's
+  # GATEWAY_DATABASE_URL. Empty: the migration uses existingSecret's, so the gateway's
+  # role needs the rights to change the schema.
+  existingSecret: ""
   backoffLimit: 3
   activeDeadlineSeconds: 300
 

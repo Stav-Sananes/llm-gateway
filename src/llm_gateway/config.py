@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     # On SIGTERM, requests still running after this are cancelled (held approvals are then
     # abandoned, cleanly). Keep it below the orchestrator's grace period (Kubernetes: 30 s).
     shutdown_timeout_s: int = Field(default=20, gt=0)
+    # How long an idle client connection stays open. Above the idle timeout of the proxy in
+    # front (ingress-nginx and most load balancers: 60 s): otherwise the proxy reuses a
+    # connection the gateway has just closed, and the request fails with a 502.
+    keep_alive_timeout_s: int = Field(default=75, gt=0)
 
     upstream_name: str = "ollama"
     upstream_base_url: str = "http://localhost:11434/v1"

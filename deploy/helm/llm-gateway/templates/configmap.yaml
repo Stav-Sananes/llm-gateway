@@ -6,6 +6,9 @@ metadata:
     {{- include "llm-gateway.labels" . | nindent 4 }}
 data:
   {{- range $key, $value := .Values.config }}
+  {{- if has $key (list "PORT" "SHUTDOWN_TIMEOUT_S" "USAGE_WORKER_METRICS_PORT" "POLICY_FILE") }}
+  {{- fail (printf "config.%s is set by the chart: use gateway.port, gateway.shutdownTimeoutSeconds, usageWorker.metricsPort or policy" $key) }}
+  {{- end }}
   GATEWAY_{{ $key }}: {{ $value | toString | quote }}
   {{- end }}
   GATEWAY_PORT: {{ .Values.gateway.port | quote }}

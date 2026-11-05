@@ -21,7 +21,11 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
 {{- define "llm-gateway.image" -}}
+{{- if .Values.image.digest -}}
+{{ .Values.image.repository }}@{{ .Values.image.digest }}
+{{- else -}}
 {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+{{- end -}}
 {{- end -}}
 
 {{- define "llm-gateway.secretName" -}}
@@ -60,6 +64,9 @@ envFrom:
       name: {{ include "llm-gateway.fullname" . }}-config
   - secretRef:
       name: {{ include "llm-gateway.secretName" . }}
+  {{- with .Values.extraEnvFrom }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
 env:
   - name: PYTHONDONTWRITEBYTECODE
     value: "1"

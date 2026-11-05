@@ -35,6 +35,8 @@ metadata:
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 spec:
   backoffLimit: {{ .Values.migrations.backoffLimit }}
+  # A replacement pod only once the failed one is gone: never two migrations at once.
+  podReplacementPolicy: Failed
   activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
   template:
     metadata:
@@ -61,7 +63,7 @@ spec:
             - name: GATEWAY_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.existingSecret | default $name }}
+                  name: {{ .Values.migrations.existingSecret | default .Values.existingSecret | default $name }}
                   key: GATEWAY_DATABASE_URL
           securityContext:
             {{- include "llm-gateway.containerSecurityContext" . | nindent 12 }}
