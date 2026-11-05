@@ -388,3 +388,18 @@ def test_the_per_tenant_limit_comes_from_settings(services: Settings) -> None:
 
     assert result.is_error and "Too many" in text(result)
     assert gateway.fs.calls == []
+
+
+def test_tool_calls_have_their_own_cap(
+    services: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with running_gateway(services, max_concurrent_tool_calls=1) as gateway:
+        thread, _ = held_call(gateway)  # waits for approval: holds the only place
+        approval_id = waiting_approval(capsys)
+        _, [busy] = mcp(gateway, ("sql__query", {"sql": "SELECT * FROM analytics.orders"}))
+        approvals(capsys, "reject", approval_id, "--by", "dana", "--yes")
+        thread.join(timeout=CLIENT_TIMEOUT_S)
+        _, [after] = mcp(gateway, ("sql__query", {"sql": "SELECT * FROM analytics.orders"}))
+
+    assert busy.is_error and "at capacity" in text(busy)
+    assert not after.is_error

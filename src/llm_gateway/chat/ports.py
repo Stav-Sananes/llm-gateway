@@ -18,6 +18,12 @@ class ProviderUnavailableError(Exception):
     """
 
 
+class GatewayBusyError(ProviderUnavailableError):
+    """This gateway had no free connection to the provider: the gateway is saturated, the
+    provider may be fine. Another target may still take the request, but it must not count
+    against the provider's circuit breaker, or a local overload opens every circuit."""
+
+
 class ProviderRejectedError(Exception):
     """The provider refused the request itself (4xx). Not retryable elsewhere."""
 

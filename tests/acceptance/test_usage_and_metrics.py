@@ -267,3 +267,20 @@ def test_the_gateway_refuses_a_body_over_its_limit(services: Settings) -> None:
 
     assert response.status_code == 413
     assert queued_usage(services) == []  # refused before anything ran
+
+
+def test_the_gateway_refuses_a_chunked_body_over_its_limit(services: Settings) -> None:
+    # No Content-Length: the body is counted as it arrives and cut off. FastAPI would answer
+    # the cut-off body with its own 400, so this checks the 413 wins on the real endpoint.
+    small = services.model_copy(update={"max_request_bytes": 1000})
+    big = json.dumps(HELLO | {"messages": [{"role": "user", "content": "x" * 2000}]}).encode()
+    with gateway(small) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            content=iter([big[:500], big[500:]]),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert queued_usage(services) == []

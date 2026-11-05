@@ -4,7 +4,12 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, Origin, Usage, collect
-from llm_gateway.chat.ports import ProviderRejectedError, ProviderUnavailableError
+from llm_gateway.chat.ports import (
+    ChunkStream,
+    GatewayBusyError,
+    ProviderRejectedError,
+    ProviderUnavailableError,
+)
 from llm_gateway.chat.resume import CONTINUE_INSTRUCTION
 from llm_gateway.routing.router import Router, Target
 from tests.support.providers import ScriptedProvider
@@ -280,3 +285,26 @@ async def test_an_answer_of_only_whitespace_is_asked_for_again_from_the_start() 
     await collect(router(a, b).stream(a_request("smart")))
 
     assert b.requests[0].messages == a_request("smart").messages
+
+
+async def test_with_every_target_busy_the_gateway_is_busy_not_the_providers_down() -> None:
+    class Busy(ScriptedProvider):
+        async def stream(self, request: ChatRequest) -> ChunkStream:
+            raise GatewayBusyError("full")
+            yield  # pragma: no cover - makes this a generator
+
+    with pytest.raises(GatewayBusyError):
+        await collect(router(Busy(()), Busy(())).stream(a_request("smart")))
+
+
+async def test_a_busy_target_is_skipped_for_the_next() -> None:
+    class Busy(ScriptedProvider):
+        async def stream(self, request: ChatRequest) -> ChunkStream:
+            raise GatewayBusyError("full")
+            yield  # pragma: no cover - makes this a generator
+
+    completion = await collect(
+        router(Busy(()), ScriptedProvider(FROM_B)).stream(a_request("smart"))
+    )
+
+    assert completion.content == "from b"

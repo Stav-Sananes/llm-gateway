@@ -28,6 +28,9 @@ class FakeLlmScript:
     omit_done: bool = False  # end the stream cleanly but without the [DONE] line
     embedding_dims: int = 64
     embed_fail_status: int | None = None
+    # Send the headers with the first token, as the gateway does, instead of at once: then
+    # "time to first byte" means the same thing directly and through the gateway.
+    headers_with_first_token: bool = False
 
 
 @dataclass
@@ -52,7 +55,10 @@ def create_fake_llm(script: FakeLlmScript, log: FakeLlmLog | None = None) -> Fas
             return JSONResponse(
                 {"error": {"message": script.fail_message}}, status_code=script.fail_status
             )
-        return StreamingResponse(_stream(script, body["model"]), media_type="text/event-stream")
+        stream = _stream(script, body["model"])
+        if script.headers_with_first_token:
+            stream = _primed(await anext(stream), stream)
+        return StreamingResponse(stream, media_type="text/event-stream")
 
     @app.post("/v1/embeddings")
     async def embeddings(request: Request) -> Response:
@@ -90,6 +96,12 @@ async def _stream(script: FakeLlmScript, model: str) -> AsyncIterator[str]:
         yield "data: [DONE]\n\n"
 
 
+async def _primed(first: str, rest: AsyncIterator[str]) -> AsyncIterator[str]:
+    yield first
+    async for event in rest:
+        yield event
+
+
 def _chunk(model: str, delta: dict[str, str], finish_reason: str | None) -> dict[str, Any]:
     return {
         "id": "fake-1",
@@ -115,3 +127,28 @@ def _usage_chunk(model: str, script: FakeLlmScript) -> dict[str, Any]:
 
 def _event(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def main() -> None:
+    """Serve the fake LLM on its own, for load and chaos runs. Configured by environment:
+    FAKE_LLM_TOKENS replies of that many tokens, FAKE_LLM_TOKEN_DELAY_S apart."""
+    import os
+
+    import uvicorn
+
+    tokens = int(os.environ.get("FAKE_LLM_TOKENS", "20"))
+    script = FakeLlmScript(
+        reply=tuple(f" token{i}" for i in range(tokens)),
+        token_delay_s=float(os.environ.get("FAKE_LLM_TOKEN_DELAY_S", "0.01")),
+        headers_with_first_token=True,
+    )
+    uvicorn.run(
+        create_fake_llm(script),
+        host="0.0.0.0",  # noqa: S104 - inside a container
+        port=int(os.environ.get("FAKE_LLM_PORT", "8000")),
+        log_level="warning",
+    )
+
+
+if __name__ == "__main__":
+    main()

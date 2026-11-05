@@ -33,3 +33,11 @@ def test_held_calls_wait_less_than_mcp_clients_time_out_by_default() -> None:
     assert (settings.approval_poll_s, settings.approval_max_pending_per_tenant) == (0.5, 10)
     with pytest.raises(ValueError, match="3600"):
         Settings(approval_timeout_s=3601)
+
+
+@pytest.mark.parametrize(
+    "field", ["max_concurrent_chats", "max_concurrent_tool_calls", "max_loop_lag_s"]
+)
+def test_admission_limits_must_be_positive(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        Settings.model_validate({field: 0})

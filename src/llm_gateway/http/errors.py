@@ -2,12 +2,18 @@
 
 import logging
 import math
+import random
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from llm_gateway.chat.ports import ProviderRejectedError, ProviderUnavailableError
+from llm_gateway.chat.ports import (
+    GatewayBusyError,
+    ProviderRejectedError,
+    ProviderUnavailableError,
+)
+from llm_gateway.http.admission import AtCapacityError, at_capacity_response
 from llm_gateway.http.presenter import UPSTREAM_UNAVAILABLE, error_payload
 from llm_gateway.limits.ports import (
     BudgetExhaustedError,
@@ -26,6 +32,9 @@ def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RateLimitedError, _rate_limited)
     app.add_exception_handler(BudgetExhaustedError, _budget_exhausted)
     app.add_exception_handler(BudgetUnavailableError, _budget_unavailable)
+    app.add_exception_handler(AtCapacityError, _at_capacity)
+    # More specific than ProviderUnavailableError, so it wins for a busy gateway.
+    app.add_exception_handler(GatewayBusyError, _at_capacity)
     app.add_exception_handler(ProviderUnavailableError, _provider_unavailable)
     app.add_exception_handler(ProviderRejectedError, _provider_rejected)
     app.add_exception_handler(RequestValidationError, _invalid_request)
@@ -79,6 +88,14 @@ async def _budget_unavailable(_: Request, error: Exception) -> JSONResponse:
         error_payload("Usage limits are temporarily unavailable.", "service_unavailable"),
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
     )
+
+
+async def _at_capacity(_: Request, error: Exception) -> JSONResponse:
+    if isinstance(error, AtCapacityError):
+        return at_capacity_response(error.retry_after_s)
+    # Every provider's connections are in use: jittered too, so the clients turned away
+    # together don't come back together.
+    return at_capacity_response(random.randint(1, 3))  # noqa: S311 - not a secret
 
 
 async def _provider_unavailable(_: Request, error: Exception) -> JSONResponse:

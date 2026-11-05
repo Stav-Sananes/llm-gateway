@@ -24,6 +24,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from llm_gateway.approvals.hold import STAYS_WAITING, Waiter
+from llm_gateway.http.admission import Admission, AtCapacityError, LoopLag
 from llm_gateway.http.auth import tenant_for_header
 from llm_gateway.http.presenter import error_payload
 from llm_gateway.tenancy.auth import Authenticator, InvalidApiKeyError
@@ -33,7 +34,9 @@ from llm_gateway.tools.gateway import ToolGateway
 from llm_gateway.tools.model import ToolResult
 
 
-def build_mcp_server(tools: ToolGateway) -> Server[Any]:
+def build_mcp_server(tools: ToolGateway, admission: Admission | None = None) -> Server[Any]:
+    admission = admission or Admission(LoopLag())
+
     async def list_tools(
         ctx: Any, params: types.PaginatedRequestParams | None
     ) -> types.ListToolsResult:
@@ -51,9 +54,15 @@ def build_mcp_server(tools: ToolGateway) -> Server[Any]:
         )
 
     async def call_tool(ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
-        result = await tools.call(
-            _tenant_of(ctx), params.name, params.arguments or {}, _client.get()
-        )
+        tenant = _tenant_of(ctx)
+        try:
+            ticket = admission.admit()  # after auth: a client without a key holds nothing
+        except AtCapacityError:
+            return _to_mcp(ToolResult.error("The gateway is at capacity. Retry shortly."))
+        try:
+            result = await tools.call(tenant, params.name, params.arguments or {}, _client.get())
+        finally:
+            ticket.release()
         return _to_mcp(result)
 
     return Server("llm-gateway", on_list_tools=list_tools, on_call_tool=call_tool)

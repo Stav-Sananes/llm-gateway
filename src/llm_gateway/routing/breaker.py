@@ -11,7 +11,12 @@ from collections.abc import Callable
 from enum import Enum, StrEnum
 
 from llm_gateway.chat.model import ChatRequest
-from llm_gateway.chat.ports import ChatProvider, ChunkStream, ProviderUnavailableError
+from llm_gateway.chat.ports import (
+    ChatProvider,
+    ChunkStream,
+    GatewayBusyError,
+    ProviderUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,18 +91,32 @@ class CircuitBreaker:
 
 
 class GuardedProvider:
-    """A provider behind a circuit breaker. A call counts as a success only once its stream
-    has ended cleanly: a provider that keeps dying mid-answer must open its circuit, even
-    though resume (chat/resume.py) hides each death from the client."""
+    """A provider behind a circuit breaker and a bulkhead.
 
-    def __init__(self, provider: ChatProvider, breaker: CircuitBreaker) -> None:
+    A call counts as a success for the breaker only once its stream has ended cleanly: a
+    provider that keeps dying mid-answer must open its circuit, even though resume
+    (chat/resume.py) hides each death from the client.
+
+    The bulkhead caps the calls in flight to this provider (its connection pool's size).
+    Past it, a call fails at once with GatewayBusyError, which doesn't count against the
+    breaker: the router moves on to the next target instead of waiting for a connection,
+    and one slow provider can't take every place in the gateway."""
+
+    def __init__(
+        self, provider: ChatProvider, breaker: CircuitBreaker, max_in_flight: int = 1000
+    ) -> None:
         self._provider = provider
         self.breaker = breaker
+        self._max_in_flight = max_in_flight
+        self._in_flight = 0  # one event loop: no lock needed
 
     async def stream(self, request: ChatRequest) -> ChunkStream:
+        if self._in_flight >= self._max_in_flight:
+            raise GatewayBusyError(f"{self.breaker.name}: {self._max_in_flight} calls in flight")
         permit = self.breaker.try_acquire()
         if permit is None:
             raise ProviderUnavailableError(f"{self.breaker.name} circuit is open")
+        self._in_flight += 1
         chunks = self._provider.stream(request)
         outcome_recorded = False
         try:
@@ -105,11 +124,18 @@ class GuardedProvider:
                 yield chunk
             self.breaker.record_success()
             outcome_recorded = True
+        except GatewayBusyError:
+            raise  # our own saturation says nothing about the provider: permit released below
         except ProviderUnavailableError:
             self.breaker.record_failure()
             outcome_recorded = True
             raise
         finally:
-            await chunks.aclose()
-            if not outcome_recorded:  # rejected, or the client left: says nothing either way
-                self.breaker.release(permit)
+            try:
+                await chunks.aclose()  # hands the connection back to the pool
+            finally:
+                # Only now: freed earlier, the next call could take the slot and find no
+                # free connection.
+                self._in_flight -= 1
+                if not outcome_recorded:  # rejected, or the client left: says nothing
+                    self.breaker.release(permit)

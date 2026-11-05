@@ -9,10 +9,16 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import anthropic
+import httpx2
 from opentelemetry.trace import StatusCode
 
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, Message, Usage
-from llm_gateway.chat.ports import ChunkStream, ProviderRejectedError, ProviderUnavailableError
+from llm_gateway.chat.ports import (
+    ChunkStream,
+    GatewayBusyError,
+    ProviderRejectedError,
+    ProviderUnavailableError,
+)
 from llm_gateway.providers.openai_compatible import UNAVAILABLE_STATUSES
 from llm_gateway.providers.tracing import record_usage, start_chat_span
 
@@ -70,6 +76,10 @@ class AnthropicProvider:
         except anthropic.APIStatusError as error:
             raise _translated(error) from error
         except anthropic.APIConnectionError as error:  # includes timeouts
+            # Our pool, not their outage. The SDK runs on httpx2, whose PoolTimeout is not
+            # httpx's.
+            if isinstance(error.__cause__, httpx2.PoolTimeout):
+                raise GatewayBusyError("no free connection to anthropic") from error
             raise ProviderUnavailableError(f"anthropic unreachable: {error}") from error
         except (anthropic.APIError, ValueError, AttributeError, KeyError) as error:
             # Malformed stream data: the provider is broken, not the request.

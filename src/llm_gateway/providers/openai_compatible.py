@@ -8,7 +8,12 @@ import httpx
 from opentelemetry.trace import StatusCode
 
 from llm_gateway.chat.model import ChatRequest, CompletionChunk, Usage
-from llm_gateway.chat.ports import ChunkStream, ProviderRejectedError, ProviderUnavailableError
+from llm_gateway.chat.ports import (
+    ChunkStream,
+    GatewayBusyError,
+    ProviderRejectedError,
+    ProviderUnavailableError,
+)
 from llm_gateway.providers.sse import DONE_SENTINEL, sse_data
 from llm_gateway.providers.tracing import record_usage, start_chat_span
 
@@ -46,6 +51,8 @@ class OpenAICompatibleProvider:
                     if data:
                         yield parse_chunk(json.loads(data))
             raise ProviderUnavailableError(f"{self._provider_name} stream ended without [DONE]")
+        except httpx.PoolTimeout as error:  # before TimeoutException, its base class
+            raise GatewayBusyError(f"no free connection to {self._provider_name}") from error
         except httpx.TimeoutException as error:
             raise ProviderUnavailableError(f"{self._provider_name} timed out") from error
         except httpx.TransportError as error:
