@@ -101,6 +101,24 @@ async def test_run_waits_out_an_outage_and_carries_on() -> None:
     assert observer.drained_results[0] == Drained(written=1)
 
 
+async def test_run_waits_out_a_store_outage_and_carries_on() -> None:
+    # Postgres down: the worker must wait, not crash (a restart would hide it in production).
+    queue, store = InMemoryUsageQueue(delivered(1)), InMemoryUsageStore(down=True)
+    observer = Observer()
+    worker = UsageWorker(queue, store, observer=observer)
+
+    with anyio.fail_after(2):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(worker.run, 0.01, 0.02)
+            await observer.failed_twice.wait()
+            store.down = False
+            await observer.wrote.wait()
+            tasks.cancel_scope.cancel()
+
+    assert len(store.events) == 1
+    assert queue.acked == ["1-0"]  # acknowledged only once stored
+
+
 async def test_an_event_that_fails_while_the_store_is_up_is_isolated_not_retried_forever() -> None:
     # The store answers, but this batch fails with an error that looks like an outage.
     poison = delivered(2, requested_model="m\x00")

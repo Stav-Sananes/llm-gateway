@@ -52,7 +52,7 @@ class QdrantAnswerStore:
                 with_payload=True,
             )
         except _UNAVAILABLE as error:
-            raise AnswerStoreUnavailableError(type(error).__name__) from error
+            raise self._unavailable(error) from error
         return [_neighbour(point) for point in found.points]
 
     async def put(
@@ -79,7 +79,15 @@ class QdrantAnswerStore:
             if self._writes % self._sweep_every == 0:
                 await self._delete_expired()
         except _UNAVAILABLE as error:
-            raise AnswerStoreUnavailableError(type(error).__name__) from error
+            raise self._unavailable(error) from error
+
+    def _unavailable(self, error: Exception) -> AnswerStoreUnavailableError:
+        if isinstance(error, UnexpectedResponse) and error.status_code == 404:
+            # The collection is gone: Qdrant has no volume, so a restart comes back empty.
+            # Create it again on the next call, instead of failing every call until the
+            # gateway restarts.
+            self._ready = False
+        return AnswerStoreUnavailableError(type(error).__name__)
 
     async def _delete_expired(self) -> None:
         expired = models.FieldCondition(key="expires_at", range=models.Range(lt=self._clock()))

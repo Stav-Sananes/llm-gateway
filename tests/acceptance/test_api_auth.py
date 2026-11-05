@@ -100,12 +100,13 @@ def test_revoked_key_is_a_401_even_after_it_was_cached(services: Settings) -> No
         assert_invalid_api_key(chat(client, api_key))
 
 
-def test_gateway_caches_keys_for_the_configured_ttl(services: Settings) -> None:
+def test_gateway_keeps_cached_keys_for_the_configured_stale_window(services: Settings) -> None:
+    # Re-checked after key_cache_ttl_s, but kept this long, for Postgres outages.
     api_key = new_api_key(services)
     with gateway(services) as client:
         chat(client, api_key)
 
-    assert 0 < cache_ttl_s(services, api_key) <= services.key_cache_ttl_s
+    assert services.key_cache_ttl_s < cache_ttl_s(services, api_key) <= services.key_cache_stale_s
 
 
 def test_health_check_needs_no_key(services: Settings) -> None:

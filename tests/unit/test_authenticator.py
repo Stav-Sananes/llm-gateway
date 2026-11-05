@@ -7,7 +7,7 @@ from llm_gateway.tenancy.admin import TenantAdmin
 from llm_gateway.tenancy.auth import Authenticator, InvalidApiKeyError
 from llm_gateway.tenancy.keys import IssuedKey, issue_key
 from llm_gateway.tenancy.model import StoredKey, Tenant
-from llm_gateway.tenancy.ports import TenantStoreUnavailableError
+from llm_gateway.tenancy.ports import REVOKED, CachedTenant, TenantStoreUnavailableError
 from tests.support.in_memory_key_cache import InMemoryKeyCache, UnreachableKeyCache
 from tests.support.in_memory_tenant_store import InMemoryTenantStore
 
@@ -50,7 +50,7 @@ async def test_first_lookup_fills_the_cache(
 
     await Authenticator(store, cache).authenticate(issued.plaintext)
 
-    assert await cache.tenant_for_key(issued.key_hash) == ACME
+    assert await cache.tenant_for_key(issued.key_hash) == CachedTenant(ACME, fresh=True)
 
 
 async def test_cached_key_authenticates_without_the_store(cache: InMemoryKeyCache) -> None:
@@ -144,3 +144,72 @@ class RevokesAfterRead(InMemoryTenantStore):
         tenant = await self._store.tenant_for_key(key_hash)
         await self._revoke()
         return tenant
+
+
+class SwitchableStore(InMemoryTenantStore):
+    """The real fake store, which a test can take down."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.down = False
+        self.lookups = 0
+
+    async def tenant_for_key(self, key_hash: str) -> Tenant | None:
+        self.lookups += 1
+        if self.down:
+            raise TenantStoreUnavailableError("store is down")
+        return await super().tenant_for_key(key_hash)
+
+
+async def a_stale_key(cache: InMemoryKeyCache) -> tuple[SwitchableStore, IssuedKey]:
+    """A key that authenticated once, then went unconfirmed for longer than the fresh window."""
+    store = SwitchableStore()
+    issued = await a_key_for(store, ACME)
+    await Authenticator(store, cache).authenticate(issued.plaintext)
+    cache.go_stale(issued.key_hash)
+    return store, issued
+
+
+async def test_a_stale_key_is_confirmed_again_and_becomes_fresh(cache: InMemoryKeyCache) -> None:
+    store, issued = await a_stale_key(cache)
+
+    tenant = await Authenticator(store, cache).authenticate(issued.plaintext)
+
+    assert tenant == ACME
+    assert store.lookups == 2  # the first lookup, and the re-check
+    assert await cache.tenant_for_key(issued.key_hash) == CachedTenant(ACME, fresh=True)
+
+
+async def test_while_the_store_is_down_a_key_confirmed_earlier_still_works(
+    cache: InMemoryKeyCache,
+) -> None:
+    store, issued = await a_stale_key(cache)
+    store.down = True
+
+    tenant = await Authenticator(store, cache).authenticate(issued.plaintext)
+
+    assert tenant == ACME
+    assert await cache.tenant_for_key(issued.key_hash) == CachedTenant(ACME, fresh=False)
+
+
+async def test_while_the_store_is_down_a_key_never_confirmed_is_not_now_rather_than_invalid(
+    cache: InMemoryKeyCache,
+) -> None:
+    store = SwitchableStore()
+    issued = await a_key_for(store, ACME)
+    store.down = True
+
+    with pytest.raises(TenantStoreUnavailableError):
+        await Authenticator(store, cache).authenticate(issued.plaintext)
+
+
+async def test_a_stale_key_revoked_meanwhile_is_rejected_and_marked(
+    cache: InMemoryKeyCache,
+) -> None:
+    store, issued = await a_stale_key(cache)
+    await store.revoke_key(issued.prefix)  # the cache mark was lost: only the store knows
+
+    with pytest.raises(InvalidApiKeyError):
+        await Authenticator(store, cache).authenticate(issued.plaintext)
+
+    assert await cache.tenant_for_key(issued.key_hash) is REVOKED

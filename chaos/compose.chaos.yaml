@@ -34,10 +34,22 @@ services:
       GATEWAY_CACHE_ENABLED: "true"
       GATEWAY_CACHE_EMBEDDING_BASE_URL: http://fake-llm:8000/v1
       GATEWAY_CACHE_EMBEDDING_DIMS: "64"
+      # Short, so the Postgres scenario can outlast it.
+      GATEWAY_KEY_CACHE_TTL_S: "5"
       # The scenarios send dozens of requests in seconds from one tenant.
       GATEWAY_RATE_LIMIT_BURST: "1000"
       GATEWAY_RATE_LIMIT_PER_S: "1000"
-    depends_on:
+    # Replaces compose.yaml's list: the chaos stack has no use for Ollama (the cache embeds
+    # with the fake model), so a fresh stack doesn't download models first.
+    depends_on: !override
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      jaeger:
+        condition: service_started
       fake-llm:
         condition: service_started
       fake-anthropic:

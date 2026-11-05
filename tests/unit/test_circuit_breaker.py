@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 
@@ -252,3 +253,41 @@ async def test_the_gateways_own_saturation_during_a_trial_frees_the_trial() -> N
 
     assert breaker.state is BreakerState.HALF_OPEN  # nothing learned about the provider
     assert breaker.try_acquire() is Permit.TRIAL  # and the next call may try
+
+
+class Pinging:
+    """Keeps sending bytes that aren't an answer (as keep-alive pings would), never a chunk.
+    Each read is prompt, so a per-read timeout never fires."""
+
+    async def stream(self, request: ChatRequest) -> ChunkStream:
+        while True:  # noqa: ASYNC110 - a ping every 10 ms, not waiting for an event
+            await asyncio.sleep(0.01)
+        yield CompletionChunk(content="never")  # pragma: no cover - makes this a generator
+
+
+async def test_a_provider_that_never_starts_answering_fails_at_the_first_chunk_deadline() -> None:
+    breaker = a_breaker(FakeClock(), threshold=1)
+    guarded = GuardedProvider(Pinging(), breaker, first_chunk_timeout_s=0.1)
+
+    started = time.monotonic()
+    with pytest.raises(ProviderUnavailableError, match="no answer within"):
+        await collect(guarded.stream(REQUEST))
+
+    assert time.monotonic() - started < 1
+    assert breaker.state is BreakerState.OPEN  # counted against it, like any outage
+
+
+async def test_the_first_chunk_deadline_does_not_cut_a_long_answer_short() -> None:
+    class SlowButSteady:
+        async def stream(self, request: ChatRequest) -> ChunkStream:
+            for word in ("a", "b", "c", "d"):
+                await asyncio.sleep(0.05)
+                yield CompletionChunk(content=word)
+
+    breaker = a_breaker(FakeClock(), threshold=1)
+    guarded = GuardedProvider(SlowButSteady(), breaker, first_chunk_timeout_s=0.1)
+
+    completion = await collect(guarded.stream(REQUEST))  # 0.2 s in all, past the deadline
+
+    assert completion.content == "abcd"
+    assert breaker.state is BreakerState.CLOSED
