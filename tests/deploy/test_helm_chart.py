@@ -4,8 +4,9 @@ These check what the chart promises an operator: what's exposed, how pods run an
 and when migrations run. The kind smoke test (deploy/kind/smoke-test.sh) checks that the
 rendered chart actually works on a cluster."""
 
+import json
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -48,12 +49,22 @@ def merged(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+GATEWAY, WORKER, MIGRATE = "gw-llm-gateway", "gw-llm-gateway-usage-worker", "gw-llm-gateway-migrate"
+_rendered: dict[str, str] = {}
+
+
 @pytest.fixture(scope="module")
 def render() -> Callable[..., list[Manifest]]:
+    """The chart rendered with REQUIRED plus `extra`; each set of values renders once."""
+
     def rendered(**extra: Any) -> list[Manifest]:
-        done = helm("template", "gw", "llm-gateway", values=merged(REQUIRED, extra))
-        assert done.returncode == 0, done.stderr
-        return [doc for doc in yaml.safe_load_all(done.stdout) if doc]
+        values = merged(REQUIRED, extra)
+        key = json.dumps(values, sort_keys=True)
+        if key not in _rendered:
+            done = helm("template", "gw", "llm-gateway", values=values)
+            assert done.returncode == 0, done.stderr
+            _rendered[key] = done.stdout
+        return [doc for doc in yaml.safe_load_all(_rendered[key]) if doc]
 
     return rendered
 
@@ -113,16 +124,23 @@ def test_every_workload_runs_as_a_non_root_user_on_a_read_only_filesystem(
             assert tmp in container["volumeMounts"], name
 
 
+@pytest.mark.parametrize(("shutdown_s", "pre_stop_s"), [(40, 7), (5, 0), (120, 15)])
 def test_the_gateway_gets_time_to_close_held_calls_before_it_is_killed(
-    render: Callable[..., list[Manifest]],
+    render: Callable[..., list[Manifest]], shutdown_s: int, pre_stop_s: int
 ) -> None:
-    manifests = render(gateway={"shutdownTimeoutSeconds": 40, "preStopSleepSeconds": 7})
-    spec = pod_specs(manifests)["gw-llm-gateway"]
-    config = find(manifests, "ConfigMap", "gw-llm-gateway-config")["data"]
+    manifests = render(
+        gateway={"shutdownTimeoutSeconds": shutdown_s, "preStopSleepSeconds": pre_stop_s}
+    )
+    spec = pod_specs(manifests)[GATEWAY]
+    config = find(manifests, "ConfigMap", f"{GATEWAY}-config")["data"]
 
-    assert config["GATEWAY_SHUTDOWN_TIMEOUT_S"] == "40"
-    assert spec["containers"][0]["lifecycle"]["preStop"]["exec"]["command"] == ["sleep", "7"]
-    assert spec["terminationGracePeriodSeconds"] > 40 + 7
+    assert config["GATEWAY_SHUTDOWN_TIMEOUT_S"] == str(shutdown_s)
+    assert spec["containers"][0]["lifecycle"]["preStop"]["exec"]["command"] == [
+        "sleep",
+        str(pre_stop_s),
+    ]
+    # A margin past both, for the shielded close of held approvals and the lifespan.
+    assert spec["terminationGracePeriodSeconds"] - pre_stop_s - shutdown_s >= 5
 
 
 def test_readiness_does_not_depend_on_the_model_providers(
@@ -169,6 +187,7 @@ def test_an_existing_secret_replaces_the_generated_ones(
     manifests = render(existingSecret="prod-gateway", secrets={"databaseUrl": "", "redisUrl": ""})
 
     assert not [m for m in manifests if m["kind"] == "Secret"]
+    assert set(pod_specs(manifests)) == {GATEWAY, WORKER, MIGRATE}
     for name, spec in pod_specs(manifests).items():
         container = spec["containers"][0]
         refs = [e["secretRef"]["name"] for e in container.get("envFrom", []) if "secretRef" in e]
@@ -243,13 +262,22 @@ def test_the_migration_can_have_its_own_existing_secret(
     assert url["valueFrom"]["secretKeyRef"]["name"] == "owner-role"
 
 
-def test_the_migration_secret_is_removed_even_when_the_migration_fails(
+def test_the_migration_secret_and_job_are_cleaned_up_without_blocking_the_next_upgrade(
     render: Callable[..., list[Manifest]],
 ) -> None:
-    secret = find(render(), "Secret", "gw-llm-gateway-migrate")
+    manifests = render()
+    secret = find(manifests, "Secret", MIGRATE)["metadata"]["annotations"]
+    job = find(manifests, "Job", MIGRATE)["metadata"]["annotations"]
 
-    # It holds the credentials of a role allowed to change the schema.
-    assert "hook-failed" in secret["metadata"]["annotations"]["helm.sh/hook-delete-policy"]
+    # The Secret holds the schema owner's credentials. Its own hook step succeeds before
+    # the Job runs, so Helm applies hook-succeeded to it whether the migration then
+    # succeeds or fails: that is what removes it.
+    assert {"before-hook-creation", "hook-succeeded"} <= set(
+        secret["helm.sh/hook-delete-policy"].split(",")
+    )
+    # A Job left by a failed run (kept for its logs) must not make the next one fail with
+    # "already exists".
+    assert "before-hook-creation" in job["helm.sh/hook-delete-policy"].split(",")
 
 
 def test_a_failed_migration_pod_is_never_replaced_while_it_still_runs(
@@ -264,9 +292,9 @@ def test_no_hash_of_the_secret_is_put_in_the_pod_spec(
     render: Callable[..., list[Manifest]],
 ) -> None:
     # Anyone who can read pods could test password guesses against it offline.
-    for name, deployment in [
-        (m["metadata"]["name"], m) for m in render() if m["kind"] == "Deployment"
-    ]:
+    deployments = {m["metadata"]["name"]: m for m in render() if m["kind"] == "Deployment"}
+    assert set(deployments) == {GATEWAY, WORKER}
+    for name, deployment in deployments.items():
         annotations = deployment["spec"]["template"]["metadata"]["annotations"]
         assert "checksum/secret" not in annotations, name
         assert "checksum/config" in annotations, name
@@ -289,9 +317,171 @@ def test_extra_environment_sources_reach_every_long_running_container(
         assert extra in specs[name]["containers"][0]["envFrom"], name
 
 
-def test_a_setting_the_chart_owns_is_refused_in_config() -> None:
+@pytest.mark.parametrize(
+    "key", ["PORT", "SHUTDOWN_TIMEOUT_S", "USAGE_WORKER_METRICS_PORT", "POLICY_FILE"]
+)
+def test_a_setting_the_chart_owns_is_refused_in_config(key: str) -> None:
     # Two GATEWAY_PORT keys would make the ConfigMap invalid, or silently drop one.
-    done = helm("template", "gw", "llm-gateway", values=merged(REQUIRED, {"config": {"PORT": "9"}}))
+    done = helm("template", "gw", "llm-gateway", values=merged(REQUIRED, {"config": {key: "9"}}))
 
     assert done.returncode != 0
-    assert "config.PORT is set by the chart" in done.stderr
+    assert f"config.{key} is set by the chart" in done.stderr
+
+
+def references(spec: Manifest) -> Iterator[tuple[str, str, str]]:
+    """(kind, name, key) of every ConfigMap or Secret a pod spec refers to; key "" for a
+    whole object."""
+    for volume in spec.get("volumes", []):
+        if "configMap" in volume:
+            yield "ConfigMap", volume["configMap"]["name"], ""
+    for container in spec["containers"]:
+        for source in container.get("envFrom", []):
+            if "configMapRef" in source:
+                yield "ConfigMap", source["configMapRef"]["name"], ""
+            if "secretRef" in source:
+                yield "Secret", source["secretRef"]["name"], ""
+        for variable in container.get("env", []):
+            if "secretKeyRef" in variable.get("valueFrom", {}):
+                ref = variable["valueFrom"]["secretKeyRef"]
+                yield "Secret", ref["name"], ref["key"]
+
+
+def assert_references_resolve(manifests: list[Manifest], existing: set[str]) -> None:
+    """Every name one object uses for another points at something that will exist: the
+    API server takes dangling names, and the pod just never starts."""
+    objects = {(m["kind"], m["metadata"]["name"]): m for m in manifests}
+    hook_secrets = {
+        m["metadata"]["name"]
+        for m in manifests
+        if m["kind"] == "Secret" and "helm.sh/hook" in m["metadata"].get("annotations", {})
+    }
+    for workload, spec in pod_specs(manifests).items():
+        is_hook = workload == MIGRATE  # runs before the release's own objects exist
+        for container in spec["containers"]:
+            mounts = {mount["name"] for mount in container.get("volumeMounts", [])}
+            assert mounts <= {v["name"] for v in spec.get("volumes", [])}, workload
+            ports = {port["name"] for port in container.get("ports", [])}
+            for probe in ("startupProbe", "readinessProbe", "livenessProbe"):
+                action = container.get(probe, {})
+                port = (action.get("httpGet") or action.get("tcpSocket") or {}).get("port")
+                if isinstance(port, str):
+                    assert port in ports, (workload, probe, port)
+        for kind, name, key in references(spec):
+            if kind == "Secret" and name in existing:
+                continue
+            if is_hook:
+                assert kind == "Secret" and name in hook_secrets, (workload, kind, name)
+            target = objects.get((kind, name))
+            assert target is not None, (workload, kind, name)
+            if key:
+                keys: dict[str, str] = target.get("stringData") or target.get("data") or {}
+                assert key in keys, (name, key)
+    service = objects[("Service", GATEWAY)]
+    gateway_ports = {p["name"] for p in pod_specs(manifests)[GATEWAY]["containers"][0]["ports"]}
+    assert {p["targetPort"] for p in service["spec"]["ports"]} <= gateway_ports
+    for ingress in (m for m in manifests if m["kind"] == "Ingress"):
+        for rule in ingress["spec"]["rules"]:
+            for path in rule["http"]["paths"]:
+                backend = path["backend"]["service"]
+                assert backend["name"] == GATEWAY
+                assert backend["port"]["name"] in {p["name"] for p in service["spec"]["ports"]}
+
+
+@pytest.mark.parametrize(
+    ("extra", "existing"),
+    [
+        ({}, set()),
+        ({"ingress": {"enabled": True}, "policy": "permit(principal, action, resource);"}, set()),
+        (
+            {"existingSecret": "prod", "secrets": {"databaseUrl": "", "redisUrl": ""}},
+            {"prod"},
+        ),
+        (
+            {
+                "existingSecret": "prod",
+                "migrations": {"existingSecret": "owner"},
+                "secrets": {"databaseUrl": "", "redisUrl": ""},
+            },
+            {"prod", "owner"},
+        ),
+    ],
+    ids=["defaults", "ingress-and-policy", "existing-secret", "existing-migration-secret"],
+)
+def test_every_reference_between_objects_resolves(
+    render: Callable[..., list[Manifest]], extra: dict[str, Any], existing: set[str]
+) -> None:
+    assert_references_resolve(render(**extra), existing)
+
+
+def selected(manifests: list[Manifest], selector: dict[str, str]) -> set[str]:
+    """The workloads whose pods a label selector picks."""
+    return {
+        m["metadata"]["name"]
+        for m in manifests
+        if m["kind"] in ("Deployment", "Job")
+        and selector.items() <= m["spec"]["template"]["metadata"]["labels"].items()
+    }
+
+
+def test_the_service_budget_and_spread_select_exactly_the_gateway_pods(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    manifests = render()
+    gateway = find(manifests, "Deployment", GATEWAY)
+    selectors = {
+        "Service": find(manifests, "Service", GATEWAY)["spec"]["selector"],
+        "PodDisruptionBudget": find(manifests, "PodDisruptionBudget", GATEWAY)["spec"]["selector"][
+            "matchLabels"
+        ],
+        "topology spread": gateway["spec"]["template"]["spec"]["topologySpreadConstraints"][0][
+            "labelSelector"
+        ]["matchLabels"],
+        "Deployment": gateway["spec"]["selector"]["matchLabels"],
+    }
+
+    for what, selector in selectors.items():
+        assert selected(manifests, selector) == {GATEWAY}, what
+    worker = find(manifests, "Deployment", WORKER)["spec"]["selector"]["matchLabels"]
+    assert selected(manifests, worker) == {WORKER}
+
+
+def test_probes_are_lenient_where_a_restart_would_spread_the_load(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    gateway = pod_specs(render())[GATEWAY]["containers"][0]
+    liveness, startup = gateway["livenessProbe"], gateway["startupProbe"]
+
+    # Not /readyz: a provider outage must not restart every pod.
+    assert liveness["httpGet"]["path"] == startup["httpGet"]["path"] == "/healthz"
+    # An overloaded pod answers late: a minute of failures before it is killed.
+    assert liveness["timeoutSeconds"] >= 5
+    assert liveness["periodSeconds"] * liveness["failureThreshold"] >= 60
+
+
+def test_a_rollout_never_takes_a_gateway_pod_away_before_its_replacement_is_ready(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    strategy = find(render(), "Deployment", GATEWAY)["spec"]["strategy"]
+
+    assert strategy["rollingUpdate"]["maxUnavailable"] == 0
+
+
+def test_every_workload_runs_with_the_default_seccomp_profile_and_its_own_group(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    specs = pod_specs(render())
+
+    assert set(specs) == {GATEWAY, WORKER, MIGRATE}
+    for name, spec in specs.items():
+        context = spec["securityContext"]
+        assert context["seccompProfile"] == {"type": "RuntimeDefault"}, name
+        assert (context["runAsGroup"], context["fsGroup"]) == (10001, 10001), name
+
+
+def test_a_failed_migration_is_not_restarted_in_place_and_cannot_run_forever(
+    render: Callable[..., list[Manifest]],
+) -> None:
+    job = find(render(), "Job", MIGRATE)["spec"]
+
+    assert job["template"]["spec"]["restartPolicy"] == "Never"  # retried as a new pod
+    assert 0 < job["activeDeadlineSeconds"] <= 600
