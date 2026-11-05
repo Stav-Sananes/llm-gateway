@@ -1,0 +1,16 @@
+# The chart's values for the kind smoke test (deploy/kind/smoke-test.sh).
+image:
+  repository: llm-gateway
+  tag: kind
+  pullPolicy: Never
+secrets:
+  databaseUrl: postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
+  redisUrl: redis://redis:6379/0
+config:
+  UPSTREAM_NAME: fake
+  UPSTREAM_BASE_URL: http://fake-llm:8000/v1
+gateway:
+  replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 512Mi}

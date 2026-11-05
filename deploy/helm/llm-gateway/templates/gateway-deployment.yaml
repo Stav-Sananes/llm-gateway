@@ -1,0 +1,108 @@
+{{- $component := dict "root" . "component" "gateway" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llm-gateway.fullname" . }}
+  labels:
+    {{- include "llm-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      {{- include "llm-gateway.selector" $component | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "llm-gateway.selector" $component | nindent 8 }}
+      annotations:
+        # Roll the pods when their settings change.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.gateway.port | quote }}
+        prometheus.io/path: /metrics
+        {{- with .Values.gateway.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "llm-gateway.serviceAccountName" . }}
+      # The gateway never calls the Kubernetes API.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "llm-gateway.podSecurityContext" . | nindent 8 }}
+      # preStop sleep + uvicorn's graceful shutdown + a margin, so held calls are closed
+      # (marked abandoned) before the kubelet kills the process.
+      terminationGracePeriodSeconds: {{ add .Values.gateway.preStopSleepSeconds .Values.gateway.shutdownTimeoutSeconds 10 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "llm-gateway.selector" $component | nindent 14 }}
+      containers:
+        - name: gateway
+          image: {{ include "llm-gateway.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["llm-gateway", "serve"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.gateway.port }}
+          {{- include "llm-gateway.env" . | nindent 10 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", {{ .Values.gateway.preStopSleepSeconds | quote }}]
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          # Readiness asks only whether this process serves HTTP, not whether the model
+          # providers are up (/readyz): an LLM outage would otherwise take every pod out of
+          # the Service at once, MCP tool calls included, which don't need a model.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Generous: under overload the event loop runs late and /healthz answers slowly.
+          # Killing an overloaded pod moves its load onto the others (a chain reaction).
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            {{- include "llm-gateway.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          {{- include "llm-gateway.volumeMounts" . | nindent 10 }}
+      {{- include "llm-gateway.volumes" . | nindent 6 }}
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

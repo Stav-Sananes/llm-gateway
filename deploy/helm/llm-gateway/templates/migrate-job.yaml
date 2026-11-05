@@ -1,0 +1,79 @@
+{{- if .Values.migrations.enabled }}
+{{- $name := printf "%s-migrate" (include "llm-gateway.fullname" .) }}
+{{- if not .Values.existingSecret }}
+# The job runs before the release's own resources exist, so it gets its own hook Secret,
+# removed once the migration succeeds.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "llm-gateway.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+type: Opaque
+stringData:
+  GATEWAY_DATABASE_URL: {{ .Values.secrets.migrationDatabaseUrl | default .Values.secrets.databaseUrl | required "secrets.databaseUrl is required (or set existingSecret)" | quote }}
+---
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "llm-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Before every install and upgrade: new code never runs against an old schema.
+    # Migrations must therefore be backwards compatible (expand, then contract).
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "llm-gateway.selector" (dict "root" . "component" "migrate") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      # The namespace's default account: the release's own doesn't exist yet. No API token.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "llm-gateway.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "llm-gateway.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["llm-gateway", "migrate"]
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: GATEWAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret | default $name }}
+                  key: GATEWAY_DATABASE_URL
+          securityContext:
+            {{- include "llm-gateway.containerSecurityContext" . | nindent 12 }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+{{- end }}
