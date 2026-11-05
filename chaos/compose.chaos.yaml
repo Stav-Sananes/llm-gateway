@@ -1,0 +1,44 @@
+# Chaos runs: `chaos/run.py` (see docs/design/14-chaos.md). Two fake providers behind the
+# route "smart" (fake Claude first, the fake local model second), short timeouts and a quick
+# breaker so each scenario finishes in seconds, and the semantic cache on.
+services:
+  fake-llm:
+    build:
+      context: .
+      dockerfile: harness/Dockerfile
+    image: llm-gateway-fake-llm:dev
+    environment:
+      FAKE_LLM_TOKENS: "5"
+      FAKE_LLM_TOKEN_DELAY_S: "0.01"
+
+  fake-anthropic:
+    image: llm-gateway-fake-llm:dev
+    command: ["python", "-m", "harness.fake_anthropic"]
+    depends_on:
+      fake-llm:
+        condition: service_started  # built by fake-llm
+
+  gateway:
+    environment:
+      GATEWAY_UPSTREAM_NAME: local
+      GATEWAY_UPSTREAM_BASE_URL: http://fake-llm:8000/v1
+      GATEWAY_ANTHROPIC_API_KEY: sk-chaos
+      GATEWAY_ANTHROPIC_BASE_URL: http://fake-anthropic:8000
+      GATEWAY_ROUTES: >-
+        {"smart": [{"provider": "anthropic", "model": "claude-opus-5-5"},
+                   {"provider": "local", "model": "fake-model"}]}
+      GATEWAY_UPSTREAM_CONNECT_TIMEOUT_S: "1"
+      GATEWAY_UPSTREAM_READ_TIMEOUT_S: "2"
+      GATEWAY_BREAKER_FAILURE_THRESHOLD: "3"
+      GATEWAY_BREAKER_RESET_S: "5"
+      GATEWAY_CACHE_ENABLED: "true"
+      GATEWAY_CACHE_EMBEDDING_BASE_URL: http://fake-llm:8000/v1
+      GATEWAY_CACHE_EMBEDDING_DIMS: "64"
+      # The scenarios send dozens of requests in seconds from one tenant.
+      GATEWAY_RATE_LIMIT_BURST: "1000"
+      GATEWAY_RATE_LIMIT_PER_S: "1000"
+    depends_on:
+      fake-llm:
+        condition: service_started
+      fake-anthropic:
+        condition: service_started

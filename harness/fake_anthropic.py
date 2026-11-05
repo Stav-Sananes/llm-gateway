@@ -150,3 +150,22 @@ def _error(status: int, message: str) -> dict[str, Any]:
 
 def _event(name: str, payload: dict[str, Any]) -> str:
     return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
+
+
+def main() -> None:
+    """Serve the fake Messages API on its own, for chaos runs. FAKE_ANTHROPIC_PORT sets the
+    port (8000)."""
+    import os
+
+    import uvicorn
+
+    uvicorn.run(
+        create_fake_anthropic(FakeAnthropicScript()),
+        host="0.0.0.0",  # noqa: S104 - inside a container
+        port=int(os.environ.get("FAKE_ANTHROPIC_PORT", "8000")),
+        log_level="warning",
+    )
+
+
+if __name__ == "__main__":
+    main()
