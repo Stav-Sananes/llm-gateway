@@ -1,0 +1,106 @@
+# Default values for llm-gateway. The chart deploys the gateway, the usage worker and a
+# migration job. Postgres, Redis, Qdrant and the model providers are not part of it: point
+# the URLs below at them.
+
+image:
+  repository: llm-gateway
+  tag: ""            # defaults to the chart's appVersion
+  # sha256:..., to pin the exact build; it wins over the tag. Tags can be moved.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Connection strings and keys. Prefer existingSecret: a Secret you manage, with the keys
+# GATEWAY_DATABASE_URL, GATEWAY_REDIS_URL and, if used, GATEWAY_ANTHROPIC_API_KEY and
+# GATEWAY_QDRANT_API_KEY. When it is empty, the chart creates one from `secrets`.
+# Pods don't restart when a Secret changes: after rotating a password or a key, run
+#   kubectl rollout restart deployment -l app.kubernetes.io/instance=<release>
+existingSecret: ""
+secrets:
+  databaseUrl: ""
+  # The migration job's connection, if it should use a role allowed to change the schema.
+  # Empty: databaseUrl.
+  migrationDatabaseUrl: ""
+  redisUrl: ""
+  anthropicApiKey: ""
+  qdrantApiKey: ""
+
+# Plain settings, passed to every container as GATEWAY_<KEY> environment variables. Keys are
+# Settings fields in upper case. JSON settings (ROUTES, MCP_SERVERS) are strings, e.g.
+#   ROUTES: '{"smart": [{"provider": "anthropic", "model": "claude-opus-5-5"}]}'
+config:
+  UPSTREAM_NAME: ollama
+  UPSTREAM_BASE_URL: http://ollama:11434/v1
+  TRACING_ENABLED: "false"
+  CACHE_ENABLED: "false"
+
+# Extra environment variables, e.g. OTEL_EXPORTER_OTLP_ENDPOINT.
+extraEnv: []
+# Extra sources of environment variables, e.g. a Secret holding GATEWAY_MCP_SERVERS when
+# its URLs carry tokens: [{secretRef: {name: mcp-servers}}].
+extraEnvFrom: []
+
+# Cedar policies for tool calls. Empty: the packaged defaults.
+policy: ""
+
+gateway:
+  replicas: 2
+  port: 8080
+  # Seconds uvicorn gives in-flight requests after SIGTERM (held approvals included).
+  shutdownTimeoutSeconds: 20
+  # Seconds the pod keeps serving after SIGTERM, while it is taken out of the Service's
+  # endpoints. Requests routed to it in that window are still answered.
+  preStopSleepSeconds: 5
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      # No CPU limit: throttling shows up as event-loop lag, and the gateway would shed
+      # load while the node has CPU to spare.
+      memory: 1Gi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+usageWorker:
+  replicas: 1
+  metricsPort: 9101
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+migrations:
+  # Run `llm-gateway migrate` as a Helm hook before every install and upgrade.
+  enabled: true
+  # With existingSecret: a Secret of your own with the migration role's
+  # GATEWAY_DATABASE_URL. Empty: the migration uses existingSecret's, so the gateway's
+  # role needs the rights to change the schema.
+  existingSecret: ""
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: gateway.local
+  tls: []
+  # Only the client APIs are exposed. /metrics, /healthz and /readyz stay inside the cluster.
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+serviceAccount:
+  create: true
+  name: ""

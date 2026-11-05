@@ -36,6 +36,9 @@ def services(postgres_url: str, redis_url: str, monkeypatch: pytest.MonkeyPatch)
     """
     monkeypatch.setenv("GATEWAY_DATABASE_URL", postgres_url)
     monkeypatch.setenv("GATEWAY_REDIS_URL", redis_url)
+    # A busy test machine runs the loop late too: without this, any test could be shed.
+    # The admission tests set their own limit.
+    monkeypatch.setenv("GATEWAY_MAX_LOOP_LAG_S", "5")
     settings = Settings()
     reset(settings)
     return settings

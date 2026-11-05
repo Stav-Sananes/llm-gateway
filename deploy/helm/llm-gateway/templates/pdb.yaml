@@ -1,0 +1,15 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "llm-gateway.fullname" . }}
+  labels:
+    {{- include "llm-gateway.labels" . | nindent 4 }}
+spec:
+  # maxUnavailable, not minAvailable: with one replica, minAvailable 1 would block every
+  # node drain.
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "llm-gateway.selector" (dict "root" . "component" "gateway") | nindent 6 }}
+{{- end }}

@@ -1,0 +1,8 @@
+llm-gateway {{ .Chart.AppVersion }} is installed as {{ include "llm-gateway.fullname" . }}.
+
+Reach it from inside the cluster at http://{{ include "llm-gateway.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+(or locally: kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "llm-gateway.fullname" . }} 8080:{{ .Values.service.port }}).
+
+Create a tenant and an API key:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "llm-gateway.fullname" . }} -- llm-gateway admin create-tenant acme
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "llm-gateway.fullname" . }} -- llm-gateway admin create-key acme

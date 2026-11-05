@@ -82,6 +82,16 @@ uv run pytest            # unit, contract and end-to-end tests (Postgres and Red
 uv run ruff check . && uv run mypy
 ```
 
+## Load, chaos and Kubernetes
+
+```bash
+load/run.sh 50 60s               # k6: latency the gateway adds, against a fake LLM (docs/design/13)
+uv run python chaos/run.py       # break one dependency at a time, check each hypothesis (docs/design/14)
+deploy/kind/smoke-test.sh        # install the Helm chart on kind and check it serves (docs/design/15)
+```
+
+The load and chaos runs use their own compose project (`gwload`); stop the dev stack first, as they publish the same ports. The kind test needs `kind` and `helm` (`brew install kind helm`). The chart is in [deploy/helm/llm-gateway](deploy/helm/llm-gateway).
+
 ## Docs
 
 - [Spec](docs/SPEC.md): scope, decisions, resilience rules

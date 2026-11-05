@@ -15,7 +15,7 @@ from llm_gateway.config import Settings
 from llm_gateway.main import build_engine, build_redis, run, run_usage_worker
 from llm_gateway.storage.audit_store import PostgresAuditStore
 from llm_gateway.storage.key_cache import RedisKeyCache
-from llm_gateway.storage.migrate import upgrade_to_head
+from llm_gateway.storage.migrate import SchemaAhead, upgrade_to_head
 from llm_gateway.storage.tenant_store import PostgresTenantStore
 from llm_gateway.tenancy.admin import KeyCacheNotClearedError, TenantAdmin
 from llm_gateway.tenancy.ports import DuplicateTenantError, KeyNotFoundError, TenantNotFoundError
@@ -36,8 +36,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "usage-worker":
         asyncio.run(run_usage_worker(settings))
     elif args.command == "migrate":
-        upgrade_to_head(settings.database_url)
-        print("database is up to date")
+        outcome = upgrade_to_head(settings.database_url)
+        if isinstance(outcome, SchemaAhead):
+            # After a rollback: the newer schema stays, and this older release runs on it.
+            ahead = ", ".join(sorted(outcome.revisions))
+            print(f"database is ahead of this release (at {ahead}); left as it is")
+        else:
+            print("database is up to date")
     elif args.command == "audit":
         return asyncio.run(_verify_audit(args.tenant, settings))
     elif args.command == "policy":

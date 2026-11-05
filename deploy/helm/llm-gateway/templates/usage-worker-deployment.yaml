@@ -1,0 +1,52 @@
+{{- $component := dict "root" . "component" "usage-worker" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llm-gateway.fullname" . }}-usage-worker
+  labels:
+    {{- include "llm-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: usage-worker
+spec:
+  replicas: {{ .Values.usageWorker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "llm-gateway.selector" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "llm-gateway.selector" $component | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.usageWorker.metricsPort | quote }}
+    spec:
+      serviceAccountName: {{ include "llm-gateway.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "llm-gateway.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: usage-worker
+          # Each pod is its own consumer (named after the pod) in one consumer group;
+          # entries a dead pod left unacknowledged are claimed by the others.
+          image: {{ include "llm-gateway.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["llm-gateway", "usage-worker"]
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.usageWorker.metricsPort }}
+          {{- include "llm-gateway.env" . | nindent 10 }}
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 6
+          securityContext:
+            {{- include "llm-gateway.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.usageWorker.resources | nindent 12 }}
+          {{- include "llm-gateway.volumeMounts" . | nindent 10 }}
+      {{- include "llm-gateway.volumes" . | nindent 6 }}

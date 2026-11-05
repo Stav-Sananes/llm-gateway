@@ -4,8 +4,10 @@ import asyncio
 
 import pytest
 
+from llm_gateway import cli
 from llm_gateway.cli import main
 from llm_gateway.config import Settings
+from llm_gateway.storage.migrate import SchemaAhead
 from llm_gateway.tenancy.auth import Authenticator, InvalidApiKeyError
 from llm_gateway.tenancy.model import Tenant
 from tests.support.backing_services import real_store_and_cache
@@ -114,6 +116,19 @@ def test_duplicate_tenant_fails_with_a_message(capsys: pytest.CaptureFixture[str
 
     assert exit_code == 1
     assert err == "error: tenant 'acme' already exists"
+
+
+def test_migrate_succeeds_on_a_database_a_newer_release_migrated(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # After `helm rollback`, the older release's hook must pass, or every later upgrade of
+    # it fails. (The detection itself is tested against Postgres in test_migrations.py.)
+    monkeypatch.setattr(cli, "upgrade_to_head", lambda url: SchemaAhead(frozenset({"0009"})))
+
+    assert main(["migrate"]) == 0
+    assert capsys.readouterr().out.strip() == (
+        "database is ahead of this release (at 0009); left as it is"
+    )
 
 
 @pytest.mark.usefixtures("services")
